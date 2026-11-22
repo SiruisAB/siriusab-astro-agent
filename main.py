@@ -18,9 +18,14 @@
 运行前：复制 .env.example 为 .env 并填入你的 API key。
 """
 
+import base64
+import io
+import mimetypes
 import os
+import re
 import sqlite3
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 from deepagents.backends import FilesystemBackend
@@ -29,10 +34,13 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import (
     HumanInTheLoopMiddleware,
     ModelRetryMiddleware,
-    SummarizationMiddleware,
     TodoListMiddleware,
     ToolRetryMiddleware,
 )
+# 用 DeepAgents 的摘要中间件而不是 langchain 的：前者接收 backend，会把被驱逐的
+# 历史原文完整 offload 到 conversation_history/<session>.md，并在摘要里写明文件路径，
+# 与 tools.py 的手动 compress 归档一起构成「原文不丢」的闭环。
+from deepagents.middleware.summarization import SummarizationMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -124,6 +132,785 @@ CHAT_PROMPT = (
     "用中文回答，专业术语保留英文。"
 )
 
+# ========== 附件（chat 模式上传文件给模型）==========
+# chat 模式不走 agent graph，因此拿不到 FilesystemMiddleware 的文件工具。这里直接
+# 在提问时把文件内容（或图片 data URL）拼进 HumanMessage，等价于"把文件递给模型"。
+# 支持：文本类（源码/CSV/JSON/LaTeX…）、图片（多模态 image_url）、PDF（需 pypdf）。
+
+_ATTACH_TEXT_SUFFIXES = {
+    ".txt", ".md", ".markdown", ".rst", ".csv", ".tsv", ".json", ".yaml", ".yml",
+    ".toml", ".ini", ".cfg", ".log", ".dat", ".xml", ".html", ".tex", ".bib",
+    ".py", ".js", ".ts", ".c", ".h", ".cpp", ".f90", ".f", ".for", ".fits.txt",
+}
+_ATTACH_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_ATTACH_PDF_SUFFIXES = {".pdf"}
+
+_ATTACH_MAX_CHARS = 60_000       # 单个文本文件注入上限（超出截断并注明）
+_ATTACH_TOTAL_CHARS = 120_000    # 一次提问所有文本附件总量上限
+_ATTACH_MAX_BYTES = 12 * 1024 * 1024   # 图片/PDF 单文件字节上限
+_ATTACH_MAX_IMAGES = 8
+
+# 压缩包：本地解包后按类型分发（没有 API 能直接吃 zip）
+_ARCHIVE_SUFFIXES = {".zip", ".tar", ".tgz", ".tbz2", ".txz"}
+_ARCHIVE_MAX_BYTES = 64 * 1024 * 1024          # 压缩包本体上限
+_ARCHIVE_MAX_UNCOMPRESSED = 256 * 1024 * 1024  # 解压总量上限（防 zip bomb）
+_ARCHIVE_MAX_ENTRIES = 2000                    # 条目数上限
+_ARCHIVE_MAX_FILES = 60                        # 实际注入的文件数上限
+_ARCHIVE_MAX_FILE_CHARS = 20_000               # 单个文件注入上限
+# 压缩包里常见的噪声目录/文件，直接跳过
+_ARCHIVE_SKIP_PARTS = {
+    ".git", ".svn", "__pycache__", "node_modules", ".venv", ".conda",
+    ".idea", ".vscode", ".DS_Store", ".ipynb_checkpoints",
+}
+_ARCHIVE_SKIP_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+
+# PDF 传输方式：
+#   text   （默认）用 pypdf 提取文本再拼进消息——任何 OpenAI 兼容端点都能用，
+#          数值/编号是精确字符串，token 最省。
+#   native 直接把 PDF 作为 file 内容块发送（OpenAI Chat Completions 的
+#          {"type":"file","file":{"file_data":"data:application/pdf;base64,..."}}）。
+#          能保留版式、表格与扫描页（模型"看"页面），但只有实现了 file 块的端点
+#          才接受；DeepSeek 之类的纯文本端点会直接 400。
+# 开关：.env 里 PDF_NATIVE=1（全局）或 PDF_NATIVE_<档案名>=1（按模型档案）。
+_PDF_NATIVE = False
+
+# PDF 页面渲染（把 PDF 每页画成 PNG 走视觉通道）——中转站/纯转发端点唯一可行的
+# "直接读 PDF" 方式：它不需要 input_file 或 file 内容块，只要端点支持视觉。
+# polyglot 投递（sandbox 模式）：把任意文件包成 PNG+原字节，走图片通道送进
+# 对方沙箱。实测该端点的图片附件会落到 /mnt/data/，模型自带 bash+python 可检查。
+_SANDBOX_MAX_BYTES = 20 * 1024 * 1024   # 附加负载上限
+_SANDBOX_CANVAS = (640, 200)
+
+_PDF_IMAGE_MAX_PAGES = 10       # 一次最多渲染页数
+_PDF_IMAGE_SCALE = 2.0          # 渲染倍率（2.0 ≈ 144dpi）
+_PDF_IMAGE_MAX_EDGE = 1600      # 长边上限，超出等比缩小以控 token
+
+
+def _sandbox_mode(profile_name: str | None = None) -> bool:
+    """是否启用 polyglot 投递：任意文件 → PNG+原字节 → 图片通道。"""
+    def truthy(v):
+        return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+    if profile_name:
+        per = os.environ.get(f"SANDBOX_MODE_{profile_name.upper()}")
+        if per is not None:
+            return truthy(per)
+    return truthy(os.environ.get("SANDBOX_MODE", "0"))
+
+
+def _polyglot_png(payload: bytes, label: str) -> bytes:
+    """构建 PNG+payload polyglot。
+
+    PNG 解码器读到 IEND 就停止，尾部字节被忽略但仍留在文件里；
+    ZIP 的中央目录在末尾，所以 zipfile 能从后往前找到 EOCD。
+    这样同一份字节既是合法图片，又能被解包。
+    """
+    from PIL import Image, ImageDraw
+
+    w, h = _SANDBOX_CANVAS
+    img = Image.new("RGB", (w, h), "white")
+    d = ImageDraw.Draw(img)
+    d.rectangle([8, 8, w - 8, h - 8], outline="black", width=2)
+    d.text((24, 40), "POLYGLOT DELIVERY", fill="black")
+    d.text((24, 70), label[:48], fill="black")
+    d.text((24, 100), f"payload: {len(payload)} bytes", fill="black")
+    d.text((24, 130), "trailing bytes after IEND carry the original file",
+           fill="black")
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue() + payload
+
+
+def _pdf_mode(profile_name: str | None = None) -> str:
+    """当前 PDF 处理方式：'text'（提文本）/ 'file'（原生块）/ 'image'（渲染成图）。
+
+    优先级：PDF_MODE_<档案> > PDF_MODE > PDF_NATIVE（旧开关，等价于 'file'）。
+    """
+    def get(var):
+        return os.environ.get(var)
+
+    raw = None
+    if profile_name:
+        raw = get(f"PDF_MODE_{profile_name.upper()}")
+    if raw is None:
+        raw = get("PDF_MODE")
+    if raw:
+        v = raw.strip().lower()
+        if v in ("image", "img", "page", "render"):
+            return "image"
+        if v in ("file", "native"):
+            return "file"
+        return "text"
+    return "file" if _pdf_native_enabled(profile_name) else "text"
+
+
+def _pdf_native_enabled(profile_name: str | None = None) -> bool:
+    """是否对当前模型档案启用原生 PDF 块。"""
+    def truthy(v):
+        return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+    if profile_name:
+        per = os.environ.get(f"PDF_NATIVE_{profile_name.upper()}")
+        if per is not None:
+            return truthy(per)
+    return truthy(os.environ.get("PDF_NATIVE", "0"))
+
+
+def _fmt_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}GB"
+
+
+# 文件头魔法字节 → 真实类型。不信扩展名：把 zip 改名成 .txt 是很常见的操作
+# （打包工具、邮件网关、上传白名单都会这么干），按名字判断只会读到乱码。
+_MAGIC = (
+    (b"PK\x03\x04", "zip"), (b"PK\x05\x06", "zip"), (b"PK\x07\x08", "zip"),
+    (b"\x1f\x8b", "gzip"), (b"BZh", "bzip2"), (b"\xfd7zXZ\x00", "xz"),
+    (b"%PDF-", "pdf"),
+    (b"\x89PNG\r\n\x1a\n", "png"), (b"\xff\xd8\xff", "jpeg"),
+    (b"GIF87a", "gif"), (b"GIF89a", "gif"),
+)
+
+
+def _sniff_kind(path: Path) -> str | None:
+    """按文件头判断真实类型：'archive' / 'pdf' / 'image' / None。"""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+    except OSError:
+        return None
+    for magic, kind in _MAGIC:
+        if head.startswith(magic):
+            if kind in ("zip", "gzip", "bzip2", "xz"):
+                return "archive"
+            if kind == "pdf":
+                return "pdf"
+            return "image"
+    # RIFF....WEBP
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image"
+    return None
+
+
+def _looks_binary(data: bytes) -> bool:
+    """粗判二进制：前 8KB 出现 NUL，或解码失败率高。"""
+    if b"\x00" in data[:8192]:
+        return True
+    try:
+        data[:8192].decode("utf-8")
+        return False
+    except UnicodeDecodeError as e:
+        # 少量坏字节可容错，大面积失败才当二进制
+        return e.start > 512
+
+
+def _is_archive_name(name: str) -> bool:
+    low = name.lower()
+    return low.endswith(".zip") or low.endswith(".tar") or low.endswith(".tar.gz") \
+        or low.endswith(".tgz") or low.endswith(".tar.bz2") or low.endswith(".tar.xz")
+
+
+def _archive_verdict(name: str) -> str:
+    """判断压缩包内某个条目要不要注入：'skip：<原因>' 或 'ok'。"""
+    from pathlib import PurePosixPath
+    parts = PurePosixPath(name.replace("\\", "/")).parts
+    if not parts:
+        return "skip:空路径"
+    if name.startswith("/") or parts[0] == "/" or ".." in parts:
+        return "skip:路径越界"        # zip slip：绝不接受跳出归档根的路径
+    if any(p in _ARCHIVE_SKIP_PARTS for p in parts):
+        return "skip:噪声目录"
+    if PurePosixPath(name).name in _ARCHIVE_SKIP_NAMES:
+        return "skip:系统文件"
+    return "ok"
+
+
+def _render_pdf_pages(path: Path) -> dict:
+    """把 PDF 每页渲染成 PNG，返回 data URL 列表（供视觉模型直接读版式）。
+
+    用途：端点不支持 file/input_file 内容块时的唯一可行路径。
+    相比提取文本，能保留表格、公式、图注、扫描页。
+    """
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        return {"ok": False, "path": str(path),
+                "note": "PDF 转图片需要 pypdfium2："
+                        ".conda\\Scripts\\python.exe -m pip install pypdfium2"}
+    try:
+        doc = pdfium.PdfDocument(str(path))
+        total = len(doc)
+        pages = min(total, _PDF_IMAGE_MAX_PAGES)
+        images = []
+        for i in range(pages):
+            page = doc[i]
+            pil = page.render(scale=_PDF_IMAGE_SCALE).to_pil()
+            # 长边超限则等比缩小，避免单页 token 过高
+            w, h = pil.size
+            longest = max(w, h)
+            if longest > _PDF_IMAGE_MAX_EDGE:
+                ratio = _PDF_IMAGE_MAX_EDGE / longest
+                pil = pil.resize((int(w * ratio), int(h * ratio)))
+            buf = io.BytesIO()
+            pil.save(buf, format="PNG", optimize=True)
+            data = base64.b64encode(buf.getvalue()).decode("ascii")
+            images.append({"name": f"{path.name} 第{i + 1}页",
+                           "data_url": f"data:image/png;base64,{data}"})
+        note = f"{path.name}（PDF {total} 页"
+        note += f"，渲染 {pages} 页为图片）" if pages < total else "，全部渲染为图片）"
+        return {"ok": True, "path": str(path), "kind": "pdfimages",
+                "images": images, "note": note}
+    except Exception as e:
+        return {"ok": False, "path": str(path), "note": f"PDF 渲染失败: {e}"}
+
+
+def _pdf_from_bytes(data: bytes, name: str) -> dict:
+    """处理内存中的 PDF（压缩包内条目）。
+
+    压缩包里嵌套 PDF 很常见，不能像二进制那样跳过。
+    按 _pdf_mode() 决定提文本还是渲染页图；'file' 模式对包内条目无意义，退回文本。
+    """
+    mode = _pdf_mode()
+    if mode == "image":
+        try:
+            import pypdfium2 as pdfium
+        except ImportError:
+            mode = "text"          # 没有渲染库就退回文本，不整条丢弃
+        else:
+            try:
+                doc = pdfium.PdfDocument(io.BytesIO(data))
+                total = len(doc)
+                pages = min(total, _PDF_IMAGE_MAX_PAGES)
+                imgs = []
+                for i in range(pages):
+                    pil = doc[i].render(scale=_PDF_IMAGE_SCALE).to_pil()
+                    w, h = pil.size
+                    longest = max(w, h)
+                    if longest > _PDF_IMAGE_MAX_EDGE:
+                        ratio = _PDF_IMAGE_MAX_EDGE / longest
+                        pil = pil.resize((int(w * ratio), int(h * ratio)))
+                    buf = io.BytesIO()
+                    pil.save(buf, format="PNG", optimize=True)
+                    imgs.append({"name": f"{name} 第{i + 1}页",
+                                 "data_url": "data:image/png;base64,"
+                                             + base64.b64encode(buf.getvalue()).decode()})
+                return {"ok": True, "kind": "images", "images": imgs,
+                        "text": "", "note": f"{name}（PDF {total} 页，渲染 {pages} 页）"}
+            except Exception as e:
+                return {"ok": False, "note": f"{name} PDF 渲染失败: {e}"}
+
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(data))
+        text = "\n".join((pg.extract_text() or "") for pg in reader.pages)
+        if not text.strip():
+            return {"ok": False, "note": f"{name}（PDF {len(reader.pages)} 页无可提取文本，"
+                                        f"可用 PDF_MODE=image 渲染）"}
+        return {"ok": True, "kind": "text", "text": text, "note": ""}
+    except Exception as e:
+        return {"ok": False, "note": f"{name} PDF 解析失败: {e}"}
+
+
+def _read_archive(path: Path) -> dict:
+    """解包压缩包，把里面的文本/图片整理成可注入的结构（纯内存，不落盘）。"""
+    import io
+    import zipfile
+
+    if path.stat().st_size > _ARCHIVE_MAX_BYTES:
+        return {"ok": False, "path": str(path),
+                "note": f"压缩包过大（{_fmt_bytes(path.stat().st_size)}）"}
+
+    entries: list[tuple[str, bytes]] = []
+    try:
+        # 按内容而不是扩展名判断容器格式（改名的 zip/tar 也能正确处理）
+        is_zip = zipfile.is_zipfile(str(path))
+        if is_zip:
+            with zipfile.ZipFile(path) as zf:
+                infos = zf.infolist()
+                declared = sum(i.file_size for i in infos)
+                if declared > _ARCHIVE_MAX_UNCOMPRESSED:
+                    return {"ok": False, "path": str(path),
+                            "note": f"解压后达 {_fmt_bytes(declared)}，超过 "
+                                    f"{_fmt_bytes(_ARCHIVE_MAX_UNCOMPRESSED)} 上限（疑似 zip bomb）"}
+                if len(infos) > _ARCHIVE_MAX_ENTRIES:
+                    return {"ok": False, "path": str(path),
+                            "note": f"条目数 {len(infos)} 超过 {_ARCHIVE_MAX_ENTRIES} 上限"}
+                for info in infos:
+                    if info.is_dir():
+                        continue
+                    # 符号链接：external_attr 高 16 位的 S_IFLNK
+                    if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                        continue
+                    entries.append((info.filename, None, info.file_size, zf))
+                # 逐个读（读完就释放，避免整包驻留内存）
+                loaded = []
+                for name, _, size, _zf in entries:
+                    with zf.open(name) as fh:
+                        loaded.append((name, fh.read(), size))
+                entries = loaded
+        else:
+            import tarfile
+            with tarfile.open(path) as tf:
+                members = tf.getmembers()
+                declared = sum(m.size for m in members if m.isfile())
+                if declared > _ARCHIVE_MAX_UNCOMPRESSED:
+                    return {"ok": False, "path": str(path),
+                            "note": f"解压后达 {_fmt_bytes(declared)}，超过上限（疑似压缩炸弹）"}
+                if len(members) > _ARCHIVE_MAX_ENTRIES:
+                    return {"ok": False, "path": str(path),
+                            "note": f"条目数 {len(members)} 超过 {_ARCHIVE_MAX_ENTRIES} 上限"}
+                loaded = []
+                for m in members:
+                    if not m.isfile() or m.issym() or m.islnk():
+                        continue
+                    fh = tf.extractfile(m)
+                    if fh is None:
+                        continue
+                    loaded.append((m.name, fh.read(), m.size))
+                entries = loaded
+    except Exception as e:
+        return {"ok": False, "path": str(path), "note": f"解包失败: {e}"}
+
+    texts, images, manifest_lines, skipped = [], [], [], 0
+    for name, data, size in sorted(entries, key=lambda x: x[0]):
+        verdict = _archive_verdict(name)
+        if verdict != "ok":
+            manifest_lines.append(f"  ✗ {name}（{verdict.split(':',1)[1]}）")
+            skipped += 1
+            continue
+
+        base = name.rsplit("/", 1)[-1]
+        suffix = "." + base.rsplit(".", 1)[-1].lower() if "." in base else ""
+
+        if suffix in _ATTACH_IMAGE_SUFFIXES:
+            if len(images) >= _ATTACH_MAX_IMAGES:
+                manifest_lines.append(f"  ✗ {name}（图片数超上限）")
+                skipped += 1
+                continue
+            if len(data) > _ATTACH_MAX_BYTES:
+                manifest_lines.append(f"  ✗ {name}（图片过大）")
+                skipped += 1
+                continue
+            mime = mimetypes.guess_type(base)[0] or "image/png"
+            images.append({"name": name,
+                           "data_url": f"data:{mime};base64,"
+                                       f"{base64.b64encode(data).decode('ascii')}"})
+            manifest_lines.append(f"  ✓ {name}（图片 {_fmt_bytes(size)}）")
+        elif suffix in _ATTACH_PDF_SUFFIXES or data[:5] == b"%PDF-":
+            got = _pdf_from_bytes(data, name)
+            if not got["ok"]:
+                manifest_lines.append(f"  ✗ {got['note']}")
+                skipped += 1
+            elif got["kind"] == "text":
+                texts.append({"name": name, "text": got["text"]})
+                manifest_lines.append(f"  ✓ {name}（PDF 文本 {len(got['text'])} 字符）")
+            else:
+                for img in got["images"]:
+                    if len(images) < _ATTACH_MAX_IMAGES:
+                        images.append({"name": img["name"], "data_url": img["data_url"]})
+                manifest_lines.append(f"  ✓ {name}（PDF 渲染 {len(got['images'])} 页）")
+        elif _is_archive_name(name):
+            # 先判嵌套压缩包：它们本身是二进制，但原因要说清（不递归解包）
+            manifest_lines.append(f"  ✗ {name}（嵌套压缩包，不递归）")
+            skipped += 1
+        elif _looks_binary(data):
+            manifest_lines.append(f"  ✗ {name}（二进制，跳过）")
+            skipped += 1
+        else:
+            if len(texts) >= _ARCHIVE_MAX_FILES:
+                manifest_lines.append(f"  ✗ {name}（文件数超上限）")
+                skipped += 1
+                continue
+            text = data.decode("utf-8", errors="replace")
+            if len(text) > _ARCHIVE_MAX_FILE_CHARS:
+                text = text[:_ARCHIVE_MAX_FILE_CHARS] + "\n...(文件过长已截断)"
+            texts.append({"name": name, "text": text})
+            manifest_lines.append(f"  ✓ {name}（文本 {len(text)} 字符）")
+
+    total = len(entries)
+    manifest = (
+        f"===== 压缩包 {path.name}（共 {total} 个条目："
+        f"注入 {len(texts)} 个文本 / {len(images)} 张图片，跳过 {skipped}）=====\n"
+        + "\n".join(manifest_lines[:200])
+        + ("\n  ...（清单过长已截断）" if len(manifest_lines) > 200 else "")
+        + "\n===== 清单结束 ====="
+    )
+    return {"ok": True, "path": str(path), "kind": "archive",
+            "manifest": manifest, "texts": texts, "images": images,
+            "note": f"{path.name}（压缩包，{total} 个条目，注入文本 {len(texts)} / 图片 {len(images)}）"}
+
+
+def _read_attachment(path_str: str) -> dict:
+    """读一个附件。返回 dict：{ok, path, kind, text, data_url, note}。
+
+    kind: "text" | "image" | "pdf"。失败时 ok=False，note 说明原因（不抛异常）。
+    """
+    p = Path(path_str).expanduser()
+    if not p.is_absolute():
+        p = Path(__file__).resolve().parent / p
+    p = p.resolve()
+    if not p.is_file():
+        return {"ok": False, "path": str(p), "note": f"文件不存在: {p}"}
+    size = p.stat().st_size
+    suffix = p.suffix.lower()
+
+    # sandbox 模式：把非图片文件包成 polyglot，走图片通道投递
+    if _sandbox_mode() and _sniff_kind(p) != "image":
+        if size > _SANDBOX_MAX_BYTES:
+            return {"ok": False, "path": str(p),
+                    "note": f"文件过大（{_fmt_bytes(size)} > {_fmt_bytes(_SANDBOX_MAX_BYTES)}），"
+                            f"polyglot 投递已跳过"}
+        try:
+            png = _polyglot_png(p.read_bytes(), p.name)
+        except ImportError:
+            return {"ok": False, "path": str(p),
+                    "note": "polyglot 需要 Pillow："
+                            ".conda\\Scripts\\python.exe -m pip install pillow"}
+        except Exception as e:
+            return {"ok": False, "path": str(p), "note": f"polyglot 构建失败: {e}"}
+        return {
+            "ok": True, "path": str(p), "kind": "image",
+            "data_url": "data:image/png;base64,"
+                        + base64.b64encode(png).decode("ascii"),
+            "note": (f"{p.name}（polyglot 投递：合法 PNG，IEND 之后附了原始 "
+                     f"{size} 字节；可用 python 扫描 PK\\x03\\x04 提取）"),
+        }
+
+    # 扩展名与真实内容不一致时以内容为准（例如 zip 被改名成 .txt）
+    sniffed = _sniff_kind(p)
+    corrected = None
+    if sniffed == "archive" and not _is_archive_name(p.name):
+        corrected = "archive"
+    elif sniffed == "pdf" and suffix not in _ATTACH_PDF_SUFFIXES:
+        corrected = "pdf"
+    elif sniffed == "image" and suffix not in _ATTACH_IMAGE_SUFFIXES:
+        corrected = "image"
+
+    if corrected == "archive":
+        got = _read_archive(p)
+        if got.get("ok"):
+            got["note"] = f"{got['note']}（按文件头识别：扩展名 {suffix or '无'} 与内容不符）"
+        return got
+    if corrected == "pdf":
+        suffix = ".pdf"          # 交给下面的 PDF 分支
+    elif corrected == "image":
+        suffix = ".png"          # 只是为了让后面按图片处理；MIME 由嗅探结果决定
+
+
+    if _is_archive_name(p.name):
+        return _read_archive(p)
+
+    if suffix in _ATTACH_IMAGE_SUFFIXES:
+        if size > _ATTACH_MAX_BYTES:
+            return {"ok": False, "path": str(p),
+                    "note": f"图片过大（{_fmt_bytes(size)} > {_fmt_bytes(_ATTACH_MAX_BYTES)}）"}
+        mime = mimetypes.guess_type(p.name)[0] if not corrected else None
+        if not mime or not mime.startswith("image/"):
+            mime = {"png": "image/png", "jpeg": "image/jpeg", "gif": "image/gif"}.get(
+                sniffed if sniffed != "image" else "png", "image/png")
+            if corrected == "image":
+                with open(p, "rb") as fh:
+                    h = fh.read(16)
+                if h.startswith(b"\x89PNG"):
+                    mime = "image/png"
+                elif h.startswith(b"\xff\xd8\xff"):
+                    mime = "image/jpeg"
+                elif h.startswith(b"GIF8"):
+                    mime = "image/gif"
+                elif h[:4] == b"RIFF":
+                    mime = "image/webp"
+        data = base64.b64encode(p.read_bytes()).decode("ascii")
+        return {"ok": True, "path": str(p), "kind": "image",
+                "data_url": f"data:{mime};base64,{data}",
+                "note": f"{p.name}（图片，{_fmt_bytes(size)}）"}
+
+    if suffix in _ATTACH_PDF_SUFFIXES:
+        if _pdf_mode() == "image":
+            return _render_pdf_pages(p)
+        if _pdf_mode() == "file":
+            # 原生 file 块：不提取文本，把 PDF 字节直接交给模型
+            if size > _ATTACH_MAX_BYTES:
+                return {"ok": False, "path": str(p),
+                        "note": f"PDF 过大（{_fmt_bytes(size)} > {_fmt_bytes(_ATTACH_MAX_BYTES)}）"}
+            data = base64.b64encode(p.read_bytes()).decode("ascii")
+            pages = "?"
+            try:
+                from pypdf import PdfReader
+                pages = len(PdfReader(str(p)).pages)
+            except Exception:
+                pass
+            return {"ok": True, "path": str(p), "kind": "file",
+                    "block": {
+                        "type": "file",
+                        "source_type": "base64",
+                        "mime_type": "application/pdf",
+                        "data": data,
+                        "filename": p.name,
+                    },
+                    "note": f"{p.name}（PDF 原生块，{pages} 页，{_fmt_bytes(size)}）"}
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            return {"ok": False, "path": str(p),
+                    "note": "读取 PDF 需要 pypdf：.conda\\Scripts\\python.exe -m pip install pypdf"}
+        try:
+            reader = PdfReader(str(p))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        except Exception as e:
+            return {"ok": False, "path": str(p), "note": f"PDF 解析失败: {e}"}
+        if not text.strip():
+            return {"ok": False, "path": str(p),
+                    "note": f"{p.name} 没有可提取文本（可能是扫描版，需先 OCR）"}
+        return {"ok": True, "path": str(p), "kind": "text", "text": text,
+                "note": f"{p.name}（PDF，{len(reader.pages)} 页，提取 {len(text)} 字符）"}
+
+    # 其余按文本读
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return {"ok": False, "path": str(p), "note": f"读取失败: {e}"}
+    return {"ok": True, "path": str(p), "kind": "text", "text": text,
+            "note": f"{p.name}（文本，{len(text)} 字符）"}
+
+
+def _compose_question(question: str, attachments: list[str], extra: str = ""):
+    """把问题与附件组装成消息 content。
+
+    无图片时返回 str；有图片时返回 OpenAI 多模态 content block 列表。
+    """
+    texts = [question] if question else []
+    images: list[str] = []
+    files: list[dict] = []
+    notes: list[str] = []
+    used = 0
+
+    for path in attachments or []:
+        got = _read_attachment(path)
+        if not got["ok"]:
+            notes.append(f"[附件未加载] {got['note']}")
+            continue
+        if got["kind"] == "image":
+            if len(images) < _ATTACH_MAX_IMAGES:
+                images.append(got["data_url"])
+                notes.append(f"[已附加图片] {got['note']}")
+            else:
+                notes.append(f"[附件跳过] {got['note']} 超过 {_ATTACH_MAX_IMAGES} 张上限")
+            continue
+        if got["kind"] == "file":
+            files.append(got["block"])
+            notes.append(f"[已附加] {got['note']}")
+            continue
+        if got["kind"] == "pdfimages":
+            for img in got["images"]:
+                if len(images) < _ATTACH_MAX_IMAGES:
+                    images.append(img["data_url"])
+            notes.append(f"[已附加] {got['note']}")
+            continue
+        if got["kind"] == "archive":
+            # 先给清单（模型据此知道包里有什么），再给各文件正文
+            texts.append(got["manifest"])
+            for item in got["texts"]:
+                remain = min(_ATTACH_MAX_CHARS, _ATTACH_TOTAL_CHARS - used)
+                if remain <= 0:
+                    break
+                body = item["text"][:remain]
+                truncated = len(item["text"]) > remain
+                used += len(body)
+                texts.append(
+                    f"===== {item['name']}"
+                    f"{'（已截断）' if truncated else ''} =====\n{body}\n===== 文件结束 ====="
+                )
+            for img in got["images"]:
+                if len(images) < _ATTACH_MAX_IMAGES:
+                    images.append(img["data_url"])
+            notes.append(f"[已附加] {got['note']}")
+            continue
+
+        body = got["text"]
+        remain = min(_ATTACH_MAX_CHARS, _ATTACH_TOTAL_CHARS - used)
+        if remain <= 0:
+            notes.append(f"[附件跳过] {got['note']} 超出总量上限")
+            continue
+        truncated = len(body) > remain
+        body = body[:remain]
+        used += len(body)
+        texts.append(
+            f"===== 附件：{os.path.basename(got['path'])}"
+            f"{'（已截断）' if truncated else ''} =====\n{body}\n===== 附件结束 ====="
+        )
+        notes.append(f"[已附加] {got['note']}" + ("，内容已截断" if truncated else ""))
+
+    if extra:
+        texts.append(extra)
+
+    header = ("\n".join(notes) + "\n\n") if notes else ""
+    body_text = header + "\n\n".join(texts)
+
+    if not images and not files:
+        return body_text
+    blocks: list = [{"type": "text", "text": body_text}]
+    blocks.extend(files)  # 原生 PDF 块放在文本之后
+    for url in images:
+        blocks.append({"type": "image_url", "image_url": {"url": url}})
+    return blocks
+
+
+def enrich_error(exc: Exception, attachments: list[str] | None = None) -> str:
+    """把端点拒绝原生 PDF 块这类错误翻译成可操作的提示。
+
+    不支持 file 块的端点会回 400 "Invalid value: 'file'. Supported values are:
+    'text' and 'image_url'." —— 直接抛给用户很难懂，这里补上怎么改。
+    """
+    msg = str(exc)
+    lowered = msg.lower()
+    has_pdf = any(str(a).lower().endswith(".pdf") for a in (attachments or []))
+    if has_pdf and ("'file'" in msg or '"file"' in msg or "file_data" in lowered
+                    or ("invalid" in lowered and "content" in lowered)):
+        return (
+            f"{msg}\n\n[建议] 当前模型端点不接受原生 PDF 文件块。"
+            "在 .env 里把 PDF_NATIVE 设为 0（或删掉该行），改用 pypdf 提取文本后再发送。"
+        )
+    return msg
+
+
+# ========== 抓取模型产物（下载方向）==========
+# 实测：模型在沙箱里生成的产物会以公开 URL 形式回传，形如
+#   https://files.chat01.ai/python-generations/<uuid>/out.zip
+# 该链接无需鉴权即可下载 —— 因此只抓已知产物主机，避免把正文里的普通链接当附件拉。
+
+_ARTIFACT_HOSTS = ("files.chat01.ai",)
+_ARTIFACT_URL_RE = re.compile(r"https?://[^\s\)\]\>\}\"'，。、]+")
+_ARTIFACT_MAX_FILES = 5
+_ARTIFACT_MAX_BYTES = 100 * 1024 * 1024
+_ARTIFACT_TIMEOUT = 60
+_ARTIFACT_DIR = Path(__file__).resolve().parent / "results" / "artifacts"
+
+
+def _artifact_auto_fetch(profile_name: str | None = None) -> bool:
+    """是否在回答后自动抓取产物链接。ARTIFACT_AUTO_FETCH=0 可关闭。"""
+    def truthy(v):
+        return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+    if profile_name:
+        per = os.environ.get(f"ARTIFACT_AUTO_FETCH_{profile_name.upper()}")
+        if per is not None:
+            return truthy(per)
+    return truthy(os.environ.get("ARTIFACT_AUTO_FETCH", "1"))
+
+
+def _artifact_urls(text: str) -> list[str]:
+    """从回答里挑出产物下载链接（仅限已知主机，去重保序）。"""
+    seen: list[str] = []
+    for m in _ARTIFACT_URL_RE.finditer(text or ""):
+        url = m.group(0).rstrip('.,;:!?')
+        host = url.split("://", 1)[-1].split("/", 1)[0].lower()
+        if any(host == h or host.endswith("." + h) for h in _ARTIFACT_HOSTS):
+            if url not in seen:
+                seen.append(url)
+    return seen
+
+
+def _safe_artifact_name(url: str, fallback: str) -> str:
+    """从 URL 取文件名并清洗，杜绝路径穿越与奇怪字符。"""
+    from urllib.parse import unquote, urlsplit
+
+    name = unquote(urlsplit(url).path.rsplit("/", 1)[-1]) or fallback
+    name = os.path.basename(name.replace("\\", "/"))
+    name = "".join(c for c in name if c.isalnum() or c in "._-")
+    return (name or fallback)[:120]
+
+
+def fetch_artifacts(text: str, dest_dir: Path | None = None,
+                    max_files: int | None = None) -> list[dict]:
+    """扫描回答中的产物链接并下载到本地。
+
+    返回 [{"ok", "url", "name", "path", "size", "note"}]；失败项 ok=False 并带 note。
+    任何异常都不抛出——抓取失败不应打断一次正常回答。
+    """
+    urls = _artifact_urls(text)
+    if not urls:
+        return []
+    limit = max_files or _ARTIFACT_MAX_FILES
+    urls = urls[:limit]
+
+    out_dir = Path(dest_dir) if dest_dir else _ARTIFACT_DIR
+    results: list[dict] = []
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return [{"ok": False, "url": u, "name": "", "path": None, "size": 0,
+                 "note": f"无法创建目录 {out_dir}: {e}"} for u in urls]
+
+    import requests
+
+    for i, url in enumerate(urls, 1):
+        name = _safe_artifact_name(url, f"artifact_{i}")
+        try:
+            with requests.get(url, stream=True, timeout=_ARTIFACT_TIMEOUT,
+                              allow_redirects=True) as r:
+                if r.status_code != 200:
+                    results.append({"ok": False, "url": url, "name": name,
+                                    "path": None, "size": 0,
+                                    "note": f"HTTP {r.status_code}"})
+                    continue
+
+                declared = int(r.headers.get("Content-Length") or 0)
+                if declared > _ARTIFACT_MAX_BYTES:
+                    results.append({"ok": False, "url": url, "name": name,
+                                    "path": None, "size": declared,
+                                    "note": f"超过 {_fmt_bytes(_ARTIFACT_MAX_BYTES)} 上限"})
+                    continue
+
+                target = out_dir / name
+                written = 0
+                with open(target, "wb") as fh:
+                    for chunk in r.iter_content(65536):
+                        if not chunk:
+                            continue
+                        written += len(chunk)
+                        if written > _ARTIFACT_MAX_BYTES:
+                            fh.close()
+                            target.unlink(missing_ok=True)
+                            raise ValueError("下载中途超过大小上限")
+                        fh.write(chunk)
+
+            results.append({"ok": True, "url": url, "name": name,
+                            "path": str(target), "size": written,
+                            "note": _fmt_bytes(written)})
+        except Exception as e:
+            results.append({"ok": False, "url": url, "name": name,
+                            "path": None, "size": 0,
+                            "note": f"{type(e).__name__}: {e}"})
+    return results
+
+
+def artifact_note(results: list[dict]) -> str:
+    """把抓取结果整理成一行提示（给终端/对话界面显示）。"""
+    if not results:
+        return ""
+    ok = [r for r in results if r["ok"]]
+    bad = [r for r in results if not r["ok"]]
+    parts = []
+    if ok:
+        names = "、".join(f"{r['name']}({r['note']})" for r in ok)
+        parts.append(f"[已下载 {len(ok)} 个产物] {names}")
+    if bad:
+        parts.append("[抓取失败] " + "；".join(f"{r['name'] or r['url']} → {r['note']}"
+                                              for r in bad))
+    return "\n".join(parts)
+
+
+def _history_note(question: str, attachments: list[str]) -> str:
+    """写进对话历史的轻量版：只留文件名，不重复存全文（避免历史无限膨胀）。"""
+    if not attachments:
+        return question
+    names = ", ".join(os.path.basename(a) for a in attachments)
+    return f"{question}\n\n[本轮附加了文件：{names}]"
+
+
 # ========== 模式配置：提示词 + 工具子集 ==========
 
 MODE_CONFIGS = {
@@ -160,6 +947,9 @@ HELP_TEXT = """
   /browse                           双栏文件浏览器（左目录树 / 右预览，q 退回对话）
                                     浏览器内按 t 呼出终端面板，可直接执行 PowerShell 命令
   /prompt <内容>                    为当前模式设置附加提示词（可有可无，叠加在默认提示词上）
+  /file <路径> [更多…]              附加文件给模型（chat 模式：文本/源码/CSV/JSON/PDF/图片）
+  /file                             查看已附加文件
+  /file clear                       清除全部附件（移除单个: /file -1）
   /prompt off                       清除当前模式的附加提示词
   /prompt                           查看当前模式的附加提示词
   /help                             显示本帮助
@@ -258,6 +1048,7 @@ def build_agent(model: ChatOpenAI, mode: str, custom_prompt: str = ""):
     """
     cfg = MODE_CONFIGS[mode]
     project_dir = os.path.dirname(os.path.abspath(__file__))
+    _fs_backend = FilesystemBackend(root_dir=project_dir, virtual_mode=True)
     agent = create_agent(
         model=model,
         tools=get_tools(cfg["tools"]) if cfg["tools"] else [],
@@ -270,9 +1061,17 @@ def build_agent(model: ChatOpenAI, mode: str, custom_prompt: str = ""):
             ToolRetryMiddleware(max_retries=2),
             TodoListMiddleware(),
             FilesystemMiddleware(
-                backend=FilesystemBackend(root_dir=project_dir, virtual_mode=True)
+                backend=_fs_backend,
+                tools=["ls", "read_file", "write_file", "edit_file", "glob", "grep"],
             ),
-            SummarizationMiddleware(model=model),
+            # 显式给 trigger：新版默认 trigger=None 会让摘要永不触发。
+            # backend 让被驱逐的历史原文落盘到 conversation_history/，可 read_file 取回。
+            SummarizationMiddleware(
+                model=model,
+                backend=_fs_backend,
+                trigger=("fraction", 0.8),
+                keep=("messages", 20),
+            ),
         ],
         checkpointer=_get_checkpointer(),
     )
@@ -360,12 +1159,15 @@ def _chat_loop(
 
 def chat_reply(
     model: ChatOpenAI, chat_history: list, question: str, custom_prompt: str = "",
+    attachments: list[str] | None = None,
     on_draft=None, on_answer=None,
 ):
     """学术问答模式：两阶段生成，两阶段均可自主调用文献/数据检索工具。
 
     对用户而言仍是一次性输出；草稿与工具调用的中间过程不进入对话历史。
     custom_prompt 为可选附加提示词，草稿和终答阶段都会叠加。
+    attachments 为待附加的文件路径列表（文本拼进提问、图片转多模态 block）；
+    附件全文只出现在本轮的模型请求里，对话历史只留文件名，避免历史无限膨胀。
     on_draft / on_answer：草稿、终答阶段的流式增量回调（对话界面传，
     逐段渲染；REPL 不传即无流式）。
     环境变量 CHAT_TWO_STAGE=0 时切换为单阶段直答（1~2 次模型调用，更省）。
@@ -374,7 +1176,10 @@ def chat_reply(
                 "reasoning": 模型自带 reasoning_content 或 ""}
     """
     tools = get_tools("query")  # 查询类 + 文献类（arXiv/ADS），无 shell
-    chat_history.append(HumanMessage(content=question))
+    attach = [a for a in (attachments or []) if a]
+    # 本轮真正发给模型的消息（含附件全文/图片），与写进历史的轻量版分开
+    human_now = HumanMessage(content=_compose_question(question, attach))
+    chat_history.append(HumanMessage(content=_history_note(question, attach)))
     trace: list = []
     thinking = {"draft": None, "trace": trace, "reasoning": ""}
     if os.environ.get("CHAT_TWO_STAGE", "1").lower() in ("0", "false", "no", "off"):
@@ -382,7 +1187,7 @@ def chat_reply(
         reply, thinking["reasoning"] = _chat_loop(
             model,
             compose_system(CHAT_PROMPT, custom_prompt),
-            list(chat_history),  # 全部历史 + 本次提问
+            [*chat_history[:-1], human_now],  # 历史 + 含附件的本次提问
             tools,
             trace=trace,
             on_delta=on_answer,
@@ -392,7 +1197,7 @@ def chat_reply(
         draft, _ = _chat_loop(
             model,
             compose_system(CHAT_DRAFT_PROMPT, custom_prompt),
-            [HumanMessage(content=question)],
+            [human_now],
             tools,
             trace=trace,
             on_delta=on_draft,
@@ -404,9 +1209,10 @@ def chat_reply(
             compose_system(CHAT_PROMPT, custom_prompt),
             [
                 *chat_history[:-1],  # 此前的对话历史
-                HumanMessage(
-                    content=f"{question}\n\n--- 内部思考草稿（供核查、修正、取舍）---\n{draft}"
-                ),
+                HumanMessage(content=_compose_question(
+                    question, [],
+                    extra=f"--- 内部思考草稿（供核查、修正、取舍）---\n{draft}",
+                )),
             ],
             tools,
             trace=trace,
@@ -502,13 +1308,63 @@ def handle_command(text: str, mode: str, custom_prompts: dict, ctx: dict | None 
             content = text.split(None, 1)[1].strip()
             custom_prompts[mode] = content
             print(f"已为 {mode} 模式设置附加提示词（对后续回答生效）:\n  {content}")
+    elif cmd == "/file":
+        # 附件管理：chat 模式把文件内容递给模型；其他模式本就有 read_file 工具，仅提示
+        files = ctx.setdefault("attachments", []) if ctx is not None else []
+        rest = text.split(None, 1)
+        sub = rest[1].strip() if len(rest) > 1 else ""
+
+        if not sub:
+            if files:
+                print(f"已附加 {len(files)} 个文件：")
+                for i, f in enumerate(files, 1):
+                    print(f"  {i}. {f}")
+                print("移除: /file -<编号>   全部清除: /file clear")
+            else:
+                print("当前没有附加文件。")
+            print("附加: /file <路径> [更多路径…]   （文本/源码/CSV/JSON/PDF/图片）")
+            print("清除: /file clear          移除单个: /file -1")
+        elif sub.lower() == "clear":
+            files.clear()
+            print("已清除全部附加文件")
+        elif sub.startswith("-") and sub[1:].isdigit():
+            idx = int(sub[1:]) - 1
+            if 0 <= idx < len(files):
+                print(f"已移除: {files.pop(idx)}")
+            else:
+                print(f"编号超出范围（当前 {len(files)} 个）")
+        else:
+            added, failed = [], []
+            for raw in sub.split():
+                path = raw.strip().strip('"').strip("'")
+                got = _read_attachment(path)
+                if got["ok"]:
+                    files.append(got["path"])
+                    added.append(got["note"])
+                else:
+                    failed.append(got["note"])
+            for a in added:
+                print(f"[已附加] {a}")
+            for f in failed:
+                print(f"[跳过] {f}")
+            if added:
+                print(f"提问时会一并发送（共 {len(files)} 个）。清除: /file clear")
+                if mode != "chat":
+                    print(f"提示：当前是 {mode} 模式，附件只在 chat 模式生效；"
+                          f"{mode} 模式可用 read_file 工具直接读文件。")
     elif cmd == "/view":
         rest = text.split(None, 1)
         if len(rest) < 2:
             print("用法: /view <文件> [起始行|起始-结束]    例: /view tools.py 100-150")
         else:
             args = rest[1].split()
-            view_file(args[0], parse_range(args[1]) if len(args) > 1 else None)
+            lines = None
+            if len(args) > 1:
+                lines = parse_range(args[1])
+                if lines is None:
+                    print(f"行号参数无效: {args[1]!r}  例: /view tools.py 100-150")
+                    return mode
+            view_file(args[0], lines)
     elif cmd == "/tree":
         depth = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 2
         list_tree(".", depth)
@@ -518,7 +1374,7 @@ def handle_command(text: str, mode: str, custom_prompts: dict, ctx: dict | None 
 
             run_browser()
         except Exception as e:
-            print(f"[浏览器无法启动] {e}\n[dim]提示: ./.conda/python.exe -m pip install textual[/dim]")
+            print(f"[浏览器无法启动] {e}\n提示: ./.conda/python.exe -m pip install textual")
     elif cmd == "/help":
         print(HELP_TEXT)
     else:
@@ -561,6 +1417,7 @@ def main():
         "agents": agents,
         "chat_history": [],  # chat 模式的独立历史
         "custom_prompts": custom_prompts,
+        "attachments": [],  # chat 模式的待附加文件（/file 管理）
     }
 
     if "--repl" in sys.argv:
@@ -601,8 +1458,18 @@ def _repl(mode: str, ctx: dict) -> None:
             continue
         try:
             if mode == "chat":
-                reply, _ = chat_reply(ctx["model"], chat_history, question, custom_prompts.get("chat", ""))
+                reply, _ = chat_reply(
+                    ctx["model"], chat_history, question, custom_prompts.get("chat", ""),
+                    attachments=ctx.get("attachments") or [],
+                )
                 print(f"\n天文Agent: {reply}\n")
+                if _artifact_auto_fetch(ctx.get("current")):
+                    try:
+                        note = artifact_note(fetch_artifacts(reply))
+                        if note:
+                            print(f"{note}\n")
+                    except Exception as e:
+                        print(f"[抓取产物出错] {type(e).__name__}: {e}\n")
             else:
                 # agent 实例懒创建；附加提示词或模型变化后自动重建（历史保留在同 thread_id）
                 current_custom = custom_prompts.get(mode, "")
@@ -631,18 +1498,29 @@ def _repl(mode: str, ctx: dict) -> None:
                     print(req.get("description") or req)
                     choice = input("y=批准 / n=拒绝 / 直接输入替代命令: ").strip()
                     if choice.lower() == "y":
-                        decision = {"type": "accept"}
+                        decision = {"type": "approve"}
                     elif choice.lower() == "n":
                         decision = {
-                            "type": "response",
+                            "type": "reject",
                             "message": "用户拒绝了这条命令，请改用其他方式完成，或询问用户怎么办。",
                         }
                     else:  # 用户输入了修改后的命令
-                        decision = {"type": "response", "message": f"请改用这条命令: {choice}"}
-                    result = agent.invoke(Command(resume=[decision]), config=config)
-                print(f"\n天文Agent: {result['messages'][-1].content}\n")
+                        _reqs = (req or {}).get("action_requests") or []
+                        _tool = _reqs[0].get("name", "run_powershell") if _reqs else "run_powershell"
+                        decision = {"type": "edit",
+                                    "edited_action": {"name": _tool, "args": {"command": choice}}}
+                    result = agent.invoke(Command(resume={"decisions": [decision]}), config=config)
+                _ans = result['messages'][-1].content
+                print(f"\n天文Agent: {_ans}\n")
+                if _artifact_auto_fetch(ctx.get("current")):
+                    try:
+                        _note = artifact_note(fetch_artifacts(str(_ans)))
+                        if _note:
+                            print(f"{_note}\n")
+                    except Exception as e:
+                        print(f"[抓取产物出错] {type(e).__name__}: {e}\n")
         except Exception as e:
-            print(f"\n[出错] {e}\n")
+            print(f"\n[出错] {enrich_error(e, ctx.get('attachments') or [])}\n")
 
 
 if __name__ == "__main__":

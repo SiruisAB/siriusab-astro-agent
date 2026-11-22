@@ -36,13 +36,24 @@ def _resolve(path: str) -> Path:
     return p if p.is_absolute() else (PROJECT_DIR / p)
 
 
-def parse_range(arg: str) -> tuple[int, int]:
-    """解析行号参数："100" → (100, 139)（该行起共 40 行，含两端），"100-150" → (100, 150)。"""
-    if "-" in arg:
-        a, b = arg.split("-", 1)
-        return max(int(a), 1), int(b)
-    n = int(arg)
-    return max(n, 1), n + 39
+def parse_range(arg: str) -> tuple[int, int] | None:
+    """解析行号参数："100" → (100, 139)（该行起共 40 行，含两端），"100-150" → (100, 150)。
+
+    参数非法（空串、非数字、"a-b"）时返回 None，由调用方提示用法，不抛异常——
+    /view 面向交互输入，不能因为多打一个字母就让整个程序崩掉。
+    """
+    arg = (arg or "").strip()
+    if not arg:
+        return None
+    try:
+        if "-" in arg:
+            a, b = arg.split("-", 1)
+            lo, hi = max(int(a), 1), int(b)
+            return (lo, hi) if hi >= lo else (lo, lo)
+        n = max(int(arg), 1)
+        return n, n + 39
+    except (TypeError, ValueError):
+        return None
 
 
 def _csv_rows(text: str) -> list[list[str]]:

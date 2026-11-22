@@ -26,9 +26,12 @@ from textual.widgets import Collapsible, Footer, Header, Input, Markdown, Static
 
 from main import (
     MODE_CONFIGS,
+    _artifact_auto_fetch,
     _msg_reasoning,
+    artifact_note,
     build_agent,
     chat_reply,
+    fetch_artifacts,
     handle_command,
 )
 from viewer import make_tree, parse_range, view_renderable
@@ -186,11 +189,13 @@ class ChatApp(App):
                 reply, thinking = chat_reply(
                     self.ctx["model"], self.ctx["chat_history"], question,
                     custom_prompt=self._custom("chat"),
+                    attachments=self.ctx.get("attachments") or [],
                     on_draft=self._on_draft_delta,
                     on_answer=self._on_answer_delta,
                 )
                 self._flush_all()
-                self.call_from_thread(self._show_reply, reply, thinking)
+                note = self._fetch_artifacts(reply)
+                self.call_from_thread(self._show_reply, reply, thinking, note)
                 return
             mode = self.mode
             current_custom = self._custom(mode)
@@ -225,13 +230,18 @@ class ChatApp(App):
                 q: "queue.Queue" = queue.Queue()
                 self.call_from_thread(self._ask_approval, req, q)
                 decision = q.get()  # worker 阻塞等待审批，界面照常可用
-                inputs = Command(resume=[decision])
+                inputs = Command(resume={"decisions": [decision]})
             state = rec["agent"].get_state(rec["config"])
             answer, thinking = _agent_turn_extract(state.values.get("messages", []))
-            self.call_from_thread(self._show_reply, answer, thinking)
+            note = self._fetch_artifacts(answer)
+            self.call_from_thread(self._show_reply, answer, thinking, note)
         except Exception as e:  # 任何错误都进对话流，不打断界面
             self._flush_answer()
-            self.call_from_thread(self._show_error, str(e))
+            from main import enrich_error
+            self.call_from_thread(
+                self._show_error,
+                enrich_error(e, self.ctx.get("attachments") or []),
+            )
 
     # ---------- 流式增量（worker 线程缓冲 → UI 线程刷新）----------
 
@@ -279,11 +289,22 @@ class ChatApp(App):
             buf, self._draft_buf = self._draft_buf, ""
             self.call_from_thread(self._append_draft, buf)
 
+    def _fetch_artifacts(self, text: str) -> str:
+        """在工作线程里抓取回答中的产物链接（失败不影响回答展示）。"""
+        try:
+            if not _artifact_auto_fetch(self.ctx["current"]):
+                return ""
+            return artifact_note(fetch_artifacts(text))
+        except Exception as e:  # 抓取永远不该打断对话
+            return f"[抓取产物出错] {type(e).__name__}: {e}"
+
     # ---------- 完成 / 出错 ----------
 
-    def _show_reply(self, reply: str, thinking: dict) -> None:
+    def _show_reply(self, reply: str, thinking: dict, note: str = "") -> None:
         self._add_thinking(thinking, skip_draft=self._draft_coll is not None)
         self._finish_live(reply)
+        if note:
+            self._append(Static(Text(note, style="cyan"), classes="thinking"))
         self._busy = False
         self._status("")
         self.query_one("#prompt", Input).focus()
@@ -333,6 +354,8 @@ class ChatApp(App):
     # ---------- shell 审批 ----------
 
     def _ask_approval(self, req, q: "queue.Queue") -> None:
+        _reqs = (req or {}).get("action_requests") or [] if isinstance(req, dict) else []
+        self._approval_tool = (_reqs[0].get("name") if _reqs else None) or "run_powershell"
         desc = req.get("description") if isinstance(req, dict) else str(req)
         self._append(Static(Text(
             f"[请求执行命令，请审批]\n{desc or req}\n"
@@ -347,12 +370,14 @@ class ChatApp(App):
         q = self.awaiting_approval["queue"]
         self.awaiting_approval = None
         if choice.lower() == "y":
-            decision = {"type": "accept"}
+            decision = {"type": "approve"}
         elif choice.lower() == "n":
-            decision = {"type": "response",
+            decision = {"type": "reject",
                         "message": "用户拒绝了这条命令，请改用其他方式完成，或询问用户怎么办。"}
         else:
-            decision = {"type": "response", "message": f"请改用这条命令: {choice}"}
+            decision = {"type": "edit",
+                        "edited_action": {"name": getattr(self, "_approval_tool", "run_powershell"),
+                                          "args": {"command": choice}}}
         self._append(Static(Text(f"[审批] {choice}", style="yellow"), classes="thinking"))
         self._status("继续执行…")
         q.put(decision)
@@ -367,8 +392,16 @@ class ChatApp(App):
                 self._append(Static(Text("用法: /view <文件> [起始行|起始-结束]", style="dim"),
                                     classes="thinking"))
             else:
+                lines = None
+                if len(args) > 2:
+                    lines = parse_range(args[2])
+                    if lines is None:
+                        self._append(Static(Text(
+                            f"行号参数无效: {args[2]!r}  例: /view tools.py 100-150", style="red"),
+                            classes="thinking"))
+                        return
                 self._append(Static(
-                    view_renderable(args[1], parse_range(args[2]) if len(args) > 2 else None),
+                    view_renderable(args[1], lines),
                     classes="assistant",
                 ))
             return

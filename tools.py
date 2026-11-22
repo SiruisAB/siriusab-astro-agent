@@ -6,21 +6,33 @@
 """
 
 import astropy.units as u
+import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import urllib.parse
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
 from astropy.utils.iers import conf as iers_conf
 from astropy.coordinates import AltAz, EarthLocation, SkyCoord
-from langchain_core.messages import HumanMessage, RemoveMessage, ToolMessage
+from langchain_core.messages import (
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+    messages_from_dict,
+    messages_to_dict,
+)
 from langchain_core.tools import InjectedToolCallId
+from langchain.tools import ToolRuntime, tool
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 
@@ -33,23 +45,24 @@ from astroquery.simbad import Simbad
 # CDS 主站（simbad.cds.unistra.fr）正在迁移，/simbad 路径暂时 404。
 # 官方公告指定哈佛镜像为替代端点，接口和数据完全一致。
 Simbad.server = "simbad.harvard.edu"
-from langchain.tools import tool
 
 # ========== 防线一：可恢复引用（Manus 思想）==========
 # 大结果落盘 results/，上下文只留"摘要前缀 + 引用路径"——
 # 即使之后被压缩/摘要，原始数据也始终可在磁盘读回。
 
 _RESULTS_DIR = Path(__file__).parent / "results"
-_BLOCKS_FILE = _RESULTS_DIR / "context_blocks.json"
-_PROTECT_RECENT = 8  # compress 保护区：最近 8 条消息不压缩
 
 
 def _save_and_reference(name: str, content: str, keep_chars: int = 500) -> str:
-    """结果落盘，返回"摘要前缀 + 引用路径"。文件名清洗为安全字符。"""
-    _RESULTS_DIR.mkdir(exist_ok=True)
+    """结果落盘，返回"摘要前缀 + 引用路径"。
+
+    文件名清洗为安全字符后带 uuid 后缀——原先用秒级时间戳，同一秒内两次同名
+    查询（如连续查两次 Vega）会互相覆盖，底层结果静默丢失。
+    """
+    _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     safe = "".join(c if c.isalnum() or c in "_-" else "_" for c in name)[:60]
     ts = datetime.now().strftime("%m%d_%H%M%S")
-    path = _RESULTS_DIR / f"{safe}_{ts}.txt"
+    path = _RESULTS_DIR / f"{safe}_{ts}_{uuid.uuid4().hex[:8]}.txt"
     path.write_text(content, encoding="utf-8")
     head = content[:keep_chars].rstrip()
     return f"{head}\n\n[完整结果共 {len(content)} 字符，已存盘: results/{path.name}]"
@@ -179,12 +192,14 @@ def search_ads(query: str, max_results: int = 5) -> str:
                 "当前可先用 search_arxiv 检索 preprint。"
             )
         import requests
-        r = requests.post(
+        # ADS 的 /v1/search/query 只接受 GET（POST 会返回 405 METHOD NOT ALLOWED），
+        # 参数走 query string，复数参数用逗号分隔。
+        r = requests.get(
             "https://api.adsabs.harvard.edu/v1/search/query",
-            json={
+            params={
                 "q": query,
                 "rows": max(1, min(max_results, 10)),
-                "fl": ["title", "author", "pubdate", "bibcode", "abstract"],
+                "fl": "title,author,pubdate,bibcode,abstract",
                 "sort": "score desc",
             },
             headers={"Authorization": f"Bearer {token}"},
@@ -208,24 +223,133 @@ def search_ads(query: str, max_results: int = 5) -> str:
         return f"ADS 检索失败: {e}"
 
 
-# ========== 防线二：简化版 ACP——模型自主压缩/恢复/搜索历史（append-only 安全） ==========
-# 思想来自 ranxianglei/opencode-acp 与 pai-acp：把压缩决策权交给模型，
-# 被压缩内容存入块注册表（results/context_blocks.json），可 decompress 恢复、
-# search_context 搜索。实现约束：绝不原地改写消息（保护 prompt cache），
-# 只通过 RemoveMessage + 追加摘要块的 langgraph 官方机制操作。
+# ========== 防线二：模型自主压缩/恢复/搜索（无损归档 + 有损摘要 + 按需精确恢复）==========
+# 原则：压缩只能减少模型看到的 token，不能让原始信息真的丢失。
+#
+#   完整历史 ──无损归档──► SQLite（原始消息 JSON + SHA-256 校验，按 thread_id 隔离）
+#            ──有损摘要──► 几百 token 的结构化摘要（进入上下文）
+#            ──按需恢复──► decompress(block_id) 取回完整原文 / search_context 免解压检索
+#
+# 与旧实现（results/context_blocks.json）的关键差异：
+#   1. 不再 str(m.content)[:3000] 截断——用 messages_to_dict 原样序列化
+#   2. 不再只存 type+content——工具调用参数、tool_call_id、元数据完整保留
+#   3. 按 thread_id 隔离——四个模式互不可见
+#   4. 摘要落库前做序列化往返校验 + 写入后校验 SHA-256，坏数据不静默使用
+#   5. 归档失败时不删除原始消息（旧实现在归档异常时会丢掉历史）
+#
+# 实现约束（append-only，保护 prompt cache）：绝不原地改写消息，只通过
+# RemoveMessage + 追加摘要块这一 langgraph 官方机制操作。
+
+_BLOCKS_DB = _RESULTS_DIR / "context_blocks.db"
+
+_BLOCKS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS context_blocks (
+    block_id      TEXT PRIMARY KEY,
+    thread_id     TEXT NOT NULL,
+    summary       TEXT NOT NULL,
+    original_json TEXT NOT NULL,
+    checksum      TEXT NOT NULL,
+    created       TEXT NOT NULL,
+    token_est     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_blocks_thread ON context_blocks(thread_id, created);
+"""
+
+_PROTECT_TURNS = 2  # 保护区：最近 N 个「用户对话轮次」不压缩（按 HumanMessage 计数）
 
 
-def _load_blocks() -> dict:
-    if _BLOCKS_FILE.exists():
-        return json.loads(_BLOCKS_FILE.read_text(encoding="utf-8"))
-    return {}
+def _blocks_conn() -> sqlite3.Connection:
+    """打开归档库；表结构与目录首次调用时自动创建。"""
+    _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(_BLOCKS_DB)
+    db.executescript(_BLOCKS_SCHEMA)
+    return db
 
 
-def _save_blocks(registry: dict) -> None:
-    _RESULTS_DIR.mkdir(exist_ok=True)
-    _BLOCKS_FILE.write_text(
-        json.dumps(registry, ensure_ascii=False, indent=1), encoding="utf-8"
+def _thread_of(runtime: ToolRuntime | None) -> str:
+    """从工具运行时取出 thread_id（各模式独立，用于会话隔离）。"""
+    cfg = (getattr(runtime, "config", None) or {}) if runtime is not None else {}
+    tid = (cfg.get("configurable") or {}).get("thread_id")
+    return str(tid) if tid else "unknown"
+
+
+def _archive_block(thread_id: str, summary: str, messages: list) -> str:
+    """把消息无损归档，返回 block_id。任何一步失败都抛异常（调用方据此中止压缩）。"""
+    raw = json.dumps(
+        messages_to_dict(messages),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
     )
+    # 写入前验证可完整往返：防止存进去的东西解不出来
+    decoded = json.loads(raw)
+    if messages_to_dict(messages_from_dict(decoded)) != decoded:
+        raise ValueError("消息序列化往返校验失败")
+
+    checksum = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    block_id = f"b{uuid.uuid4().hex[:12]}"
+    created = datetime.now().isoformat(timespec="seconds")
+    token_est = sum(len(str(m.content)) for m in messages) // 3
+
+    with closing(_blocks_conn()) as db:
+        with db:
+            db.execute(
+                "INSERT INTO context_blocks"
+                " (block_id, thread_id, summary, original_json, checksum, created, token_est)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (block_id, thread_id, summary, raw, checksum, created, token_est),
+            )
+    return block_id
+
+
+def _load_block(thread_id: str, block_id: str) -> list:
+    """取回并校验归档消息；不存在/校验失败/解码失败都抛异常。"""
+    with closing(_blocks_conn()) as db:
+        row = db.execute(
+            "SELECT original_json, checksum FROM context_blocks"
+            " WHERE thread_id = ? AND block_id = ?",
+            (thread_id, block_id),
+        ).fetchone()
+    if row is None:
+        raise KeyError(f"压缩块 {block_id} 不存在或不属于当前会话")
+    raw, checksum = row
+    if hashlib.sha256(raw.encode("utf-8")).hexdigest() != checksum:
+        raise ValueError(f"压缩块 {block_id} 完整性校验失败（归档数据已被改动）")
+    return messages_from_dict(json.loads(raw))
+
+
+def _safe_cutoff(msgs: list, cut: int) -> int:
+    """把切点向前挪到安全位置，避免拆开 AI 工具调用与对应结果。
+
+    若切点正好落在一个 ToolMessage 上，说明它的发起方 AI 消息会被删掉而结果留下，
+    这会让上下文出现孤立的工具结果。向前回退直到该处不再是工具结果。
+    """
+    while cut > 0 and isinstance(msgs[cut], ToolMessage):
+        cut -= 1
+    # 切点前一条若是带 tool_calls 的 AI 消息，说明这一对还没走完，一并保留
+    while cut > 0 and getattr(msgs[cut - 1], "tool_calls", None):
+        cut -= 1
+    return cut
+
+
+def _plan_compression(msgs: list) -> tuple[list, str]:
+    """决定压缩哪些消息。返回 (待压缩消息, 说明)。
+
+    按「用户轮次」而不是「消息条数」保护最近内容：一轮 agent 调用会产生
+    多条 AI/Tool 消息，用固定条数做保护区很容易切在半路。
+    """
+    turn_starts = [i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)]
+    if len(turn_starts) <= _PROTECT_TURNS:
+        return [], f"只有 {len(turn_starts)} 个对话轮次（保护区 {_PROTECT_TURNS} 轮），无需压缩"
+
+    cut = _safe_cutoff(msgs, turn_starts[-_PROTECT_TURNS])
+    if cut <= 0:
+        return [], "没有可压缩的早期历史（切点落在保护区起点）"
+
+    candidates = [m for m in msgs[:cut] if not isinstance(m, SystemMessage)]
+    if not candidates:
+        return [], "早期历史只有系统消息，无需压缩"
+    return candidates, ""
 
 
 @tool
@@ -233,78 +357,141 @@ def compress(
     summary: str,
     state: Annotated[dict, InjectedState],
     tool_call_id: Annotated[str, InjectedToolCallId],
+    runtime: ToolRuntime = None,
 ) -> Command:
     """把较早的对话历史压缩为一个摘要块，释放上下文空间。
 
     summary 必须保留：全部数值结果与天体坐标、文件路径、关键决策及理由、
-    未完成的任务、报错信息。最近几轮对话和最后一条用户消息不会被压缩。
-    压缩后的块可用 decompress 恢复原文，或用 search_context 搜索。
+    未完成的任务、报错信息。最近两个对话轮次和最后一条用户消息不会被压缩。
+    被压缩的完整原文会无损归档，可用 decompress(block_id) 取回，
+    或用 search_context 免解压检索。
     """
-    msgs = state.get("messages", [])
-    if len(msgs) <= _PROTECT_RECENT + 2:
+    msgs = list(state.get("messages", []))
+    thread_id = _thread_of(runtime)
+
+    targets, reason = _plan_compression(msgs)
+    if not targets:
         return Command(
-            update={"messages": [ToolMessage("历史太短，无需压缩", tool_call_id=tool_call_id)]}
-        )
-    range_msgs = msgs[:-_PROTECT_RECENT]
-    if not range_msgs:
-        return Command(
-            update={"messages": [ToolMessage("没有可压缩的早期历史", tool_call_id=tool_call_id)]}
+            update={"messages": [ToolMessage(reason, tool_call_id=tool_call_id)]}
         )
 
-    registry = _load_blocks()
-    bid = f"b{len(registry) + 1}"
-    registry[bid] = {
-        "summary": summary,
-        "created": datetime.now().isoformat(timespec="seconds"),
-        "original": [
-            {"type": type(m).__name__, "content": str(m.content)[:3000]} for m in range_msgs
-        ],
-        "compressed_ids": [m.id for m in range_msgs if m.id],
-    }
-    _save_blocks(registry)
-
-    updates: list = [RemoveMessage(id=m.id) for m in range_msgs if m.id]
-    updates.append(
-        HumanMessage(
-            content=f"[压缩块 {bid}]（{len(range_msgs)} 条历史已压缩，"
-            f"decompress 恢复 / search_context 搜索）\n{summary}"
-        )
-    )
-    updates.append(
-        ToolMessage(
-            content=f"已压缩 {len(range_msgs)} 条消息为块 {bid}。摘要已写入上下文。",
+    # 只归档「能删掉的」消息：没有 id 的消息无法 RemoveMessage，若归档了却不删，
+    # 摘要与原文会同时在上下文里出现，后续 decompress 还会重复一遍。
+    removable = [m for m in targets if getattr(m, "id", None)]
+    if not removable:
+        return Command(update={"messages": [ToolMessage(
+            "压缩中止：待压缩的消息都没有 id，无法从历史中移除。",
             tool_call_id=tool_call_id,
+        )]})
+    skipped = len(targets) - len(removable)
+
+    # 先归档，成功后才动上下文；归档失败则一条消息都不删
+    try:
+        block_id = _archive_block(thread_id, summary, removable)
+    except Exception as e:
+        return Command(update={"messages": [ToolMessage(
+            f"压缩中止：原文归档失败（{type(e).__name__}: {e}）。"
+            "为免丢失历史，未删除任何消息。可改用更小的范围重试。",
+            tool_call_id=tool_call_id,
+        )]})
+
+    updates: list = [RemoveMessage(id=m.id) for m in removable]
+    updates.append(HumanMessage(
+        content=(
+            f"[压缩块 {block_id}]（{len(removable)} 条历史已无损归档；"
+            f"decompress('{block_id}') 取回完整原文，search_context 可免解压检索）\n"
+            f"{summary}"
         )
-    )
+    ))
+    updates.append(ToolMessage(
+        content=(
+            f"已归档并压缩 {len(removable)} 条消息为块 {block_id}"
+            f"（原始 {sum(len(str(m.content)) for m in removable)} 字符完整保存）。"
+            + (f" 另有 {skipped} 条无 id 的消息未处理。" if skipped else "")
+        ),
+        tool_call_id=tool_call_id,
+    ))
     return Command(update={"messages": updates})
 
 
 @tool
-def decompress(block_id: str) -> str:
-    """恢复某个压缩块的完整原文到上下文（block_id 如 b1、b2）。"""
-    registry = _load_blocks()
-    if block_id not in registry:
-        return f"未找到块 {block_id}。已有块: {', '.join(registry) or '无'}"
-    block = registry[block_id]
-    text = "\n".join(f"[{m['type']}] {m['content']}" for m in block["original"])
-    return f"块 {block_id} 原文（{len(block['original'])} 条消息）：\n{text}"
+def decompress(block_id: str, runtime: ToolRuntime = None) -> str:
+    """按 block_id（如 b1a2b3c4d5e6）取回某个压缩块的完整原文，不截断。
+
+    恢复会占用较多上下文，只在确实需要核对细节（原始数值、完整工具输出、
+    报错全文）时调用；只想确认某件事是否存在时先用 search_context。
+    """
+    thread_id = _thread_of(runtime)
+    try:
+        messages = _load_block(thread_id, block_id)
+    except KeyError:
+        with closing(_blocks_conn()) as db:
+            rows = db.execute(
+                "SELECT block_id FROM context_blocks WHERE thread_id = ? ORDER BY created",
+                (thread_id,),
+            ).fetchall()
+        ids = ", ".join(r[0] for r in rows) or "无"
+        return f"未找到块 {block_id}。当前会话已有块: {ids}"
+    except Exception as e:
+        return f"恢复块 {block_id} 失败：{type(e).__name__}: {e}"
+
+    parts = []
+    for i, m in enumerate(messages, 1):
+        role = type(m).__name__
+        body = str(m.content)
+        calls = getattr(m, "tool_calls", None)
+        extra = ""
+        if calls:
+            extra = "\n  工具调用: " + json.dumps(calls, ensure_ascii=False)
+        parts.append(f"[{i}] {role}{extra}\n{body}")
+    total = sum(len(str(m.content)) for m in messages)
+    return (
+        f"块 {block_id} 完整原文（{len(messages)} 条消息，共 {total} 字符，未截断）：\n\n"
+        + "\n\n".join(parts)
+    )
 
 
 @tool
-def search_context(keyword: str) -> str:
-    """在所有压缩块的原文和摘要中搜索关键词（无需解压），返回命中片段。"""
-    keyword_l = keyword.lower()
+def search_context(keyword: str, runtime: ToolRuntime = None) -> str:
+    """在当前会话已归档的历史中搜索关键词（免解压），返回命中片段。
+
+    适合确认「之前算过的那个数值/引用过的那篇文献/那条报错」是否存在。
+    只返回片段，取全文请用 decompress。
+    """
+    thread_id = _thread_of(runtime)
+    kw = (keyword or "").strip()
+    if not kw:
+        return "请给出要搜索的关键词"
+    like = f"%{kw}%"
+    with closing(_blocks_conn()) as db:
+        rows = db.execute(
+            "SELECT block_id, summary, original_json FROM context_blocks"
+            " WHERE thread_id = ? AND (summary LIKE ? OR original_json LIKE ?)"
+            " ORDER BY created",
+            (thread_id, like, like),
+        ).fetchall()
+    if not rows:
+        return f"当前会话的归档中未找到: {kw}"
+
     hits = []
-    for bid, block in _load_blocks().items():
-        if keyword_l in block["summary"].lower():
-            hits.append(f"[{bid} 摘要] {block['summary'][:200]}")
-        for m in block["original"]:
-            content = m["content"]
-            pos = content.lower().find(keyword_l)
+    low = kw.lower()
+    for block_id, summary, original_json in rows:
+        if low in summary.lower():
+            hits.append(f"[{block_id} 摘要] {summary[:200]}")
+        try:
+            messages = messages_from_dict(json.loads(original_json))
+        except Exception:
+            continue
+        for i, m in enumerate(messages, 1):
+            content = str(m.content)
+            pos = content.lower().find(low)
             if pos >= 0:
                 start = max(0, pos - 40)
-                hits.append(f"[{bid} {m['type']}] ...{content[start:pos + 80]}...")
-    return "\n".join(hits[:12]) if hits else f"所有压缩块中未找到: {keyword}"
+                hits.append(
+                    f"[{block_id} 第{i}条 {type(m).__name__}] "
+                    f"...{content[start:pos + len(kw) + 80]}..."
+                )
+    return "\n".join(hits[:12])
 
 
 def get_tools(subset: str = "all"):

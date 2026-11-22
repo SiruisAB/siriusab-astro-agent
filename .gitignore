@@ -1,11 +1,35 @@
-# 本地环境与依赖目录
+# 虚拟环境与依赖目录
 .conda/
 .venv/
-__pycache__/
+venv*/
 
-# 密钥配置（真实 API key，绝不入库）
+# Python 缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 密钥与配置（含真实 API key，绝不入库）
 .env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa*
 
 # 运行时产物
 results/
 sessions.db*
+conversation_history/
+*.log
+
+# 测试临时文件
+tests/_*
+tests/**/_*
+
+# 系统/IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
