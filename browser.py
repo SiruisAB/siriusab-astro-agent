@@ -167,13 +167,14 @@ class BrowserScreen(Screen):
                 cwd=self.cwd, capture_output=True, timeout=SHELL_TIMEOUT,
                 text=True, encoding="utf-8", errors="replace",
             )
-            self.call_from_thread(self._log_result, cmd,
-                                  proc.stdout or "", proc.stderr or "", proc.returncode)
+            # call_from_thread 只在 App 上：Screen 里必须经 self.app 调用
+            self.app.call_from_thread(self._log_result, cmd,
+                                      proc.stdout or "", proc.stderr or "", proc.returncode)
         except subprocess.TimeoutExpired:
-            self.call_from_thread(self._log_result, cmd, "",
-                                  f"[超时] 超过 {SHELL_TIMEOUT} 秒已终止", -1)
+            self.app.call_from_thread(self._log_result, cmd, "",
+                                      f"[超时] 超过 {SHELL_TIMEOUT} 秒已终止", -1)
         except FileNotFoundError:
-            self.call_from_thread(self._log_result, cmd, "", "[找不到 powershell.exe]", -1)
+            self.app.call_from_thread(self._log_result, cmd, "", "[找不到 powershell.exe]", -1)
 
     def _log_result(self, cmd: str, out: str, err: str, code: int) -> None:
         log = self.query_one("#termlog", RichLog)
@@ -183,6 +184,14 @@ class BrowserScreen(Screen):
             log.write(Text(err.rstrip(), style="red"))
         if code:
             log.write(Text(f"(退出码 {code})", style="dim red"))
+        # 常见误操作：把要问模型的长句敲进了终端输入条
+        if code not in (0, None) and any(ord(c) > 127 for c in cmd) \
+                and ("is not recognized" in err or "CommandNotFound" in err):
+            log.write(Text(
+                "[提示] 这看起来是要问模型的中文问题，不是终端命令。"
+                "按 q/esc 回到对话直接提问，或在这里输入 / 开头的对话命令。",
+                style="yellow",
+            ))
 
     def action_quit(self) -> None:
         """被聊天应用 push 时返回对话；独立运行时退出应用。"""
