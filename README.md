@@ -70,6 +70,48 @@ chat 模式原本没有任何文件通道——它的循环不走 agent graph，
 | 任意文件（`SANDBOX_MODE=1`） | 包成 PNG+原字节 polyglot 送进对方沙箱 | 模型用 python 自己解；不占上下文 token |
 | 压缩包 zip / tar / tar.gz / tgz | 本地解包后逐个分发：文本注入、图片转多模态块 | 二进制/噪声目录/嵌套包跳过；清单告诉模型包里有什么 |
 
+### 上传方向：polyglot 投递（`SANDBOX_MODE=1`）
+
+`file` 内容块在这类转发端点上**完全不登记**（见下方 7 次实验），但图片附件会落到
+对方沙箱的 `/mnt/data/`，而模型自带 `bash` + `python`。所以可以把任意文件伪装成
+一张合法 PNG 投递：
+
+```
+原文件 → 合法 PNG 头 + 原字节追加在 IEND 之后 → image_url
+```
+
+PNG 解码器读到 IEND 就停，尾部数据被忽略但仍留在文件里；ZIP 的中央目录在末尾，
+所以同一份字节**对图片解码器是 PNG，对 zipfile 是 ZIP**。
+
+**端到端实测**（28404 字节的 zip，内含 `1.png` / `DOCX 文档.pdf` / `Text Document.txt`）：
+
+```
+原文件    : 28404 bytes
+polyglot  : 34175 bytes（PNG 画布 + 原字节追加）
+本地验证  : PIL 认定 PNG 通过 / zipfile.is_zipfile 通过
+```
+
+模型侧收到的证据——它在沙箱里实际执行了：
+
+```python
+bash -lc file /mnt/data/image_82f7cddf....jpg && python - <<'PY'
+print('ZIP local header:', [i for i in range(len(b)) if b.startswith(b'PK\x03\x04', i)][:12])
+print('ZIP EOCD:', b.rfind(b'PK\x05\x06'))
+PY
+```
+
+**真值命中 4/4**：
+
+| 内容 | 真值 | 结果 |
+|---|---|---|
+| 图内文字 | `rtwrretvcb` | 命中 |
+| PDF 文本 | `zxccznmbn` | 命中 |
+| txt 内容 | `213123qwe` | 命中 |
+| 文件名 | `New Text Document` | 命中 |
+
+优点：文件进沙箱后模型按需读取，**不占本地上下文 token**，适合大包。
+代价：文件会离开本机，且沙箱产出物落在公开 URL（见下方安全提示）。
+
 ### 下载方向：抓取模型产物
 
 模型在沙箱里生成的文件会以**公开 URL** 回传，形如：
@@ -96,6 +138,29 @@ https://files.chat01.ai/python-generations/<uuid>/out.zip
 
 只抓已知产物主机（`_ARTIFACT_HOSTS`），正文里的普通链接（arXiv、示例站）不会被误抓。
 文件名经过清洗，`../`、URL 编码穿越、query string 都会被剥掉。
+
+### 通道实测矩阵（同一份 zip，7 次实验）
+
+| # | 提交方式 | 模型 | 结果 |
+|---|---|---|---|
+| 1 | `file` + `application/zip` | gpt-5-6 | 静默丢弃，模型说「没有文件」 |
+| 2 | `file` + `text/plain`（改名 .txt） | gpt-5-6 | 静默丢弃 |
+| 3 | 内容改为纯 base64 文本 + `text/plain` | gpt-6-thinking | 静默丢弃 |
+| 4 | 同上，重复一次 | gpt-6-thinking | 静默丢弃 |
+| 5 | `file` × 6 种扩展名同时提交 | gpt-6-thinking | **6/6 未送达**，模型 `/files/list` 返回 `No files are present` |
+| 6 | `image_url` + zip 字节冒充 PNG | gpt-6-thinking | **`Attachment preparation failed`** |
+| 7 | **`image_url` + 合法 PNG/ZIP polyglot** | gpt-6-thinking | 解出全部内容，**4/4 命中** |
+
+结论：
+
+- `file` 块**不是**被过滤或格式白名单拦掉——连文件名都到不了，说明根本没有登记进附件系统
+- 图片通道**有**真实的附件准备流水线（会解码校验），所以伪装必须真的合法
+- 一旦通过校验，文件进入 `/mnt/data/`，模型的 shell 就能操作它
+
+附带发现：该端点 `POST /files` 返回 404、`input_file` 返回 400、`code_interpreter`
+声明被接受但输出无 `code_interpreter_call`——**触发代码执行靠的是图片附件进沙箱，
+不是声明工具**。
+
 
 ### 扩展名与内容不符（改名的 zip）
 
@@ -193,40 +258,6 @@ PDF(TOKEN: ABC789 / energy 1e40 erg) → PNG → image_url
 默认限 10 页（`_PDF_IMAGE_MAX_PAGES`）、长边 1600px 自动缩放。
 
 需要 `pypdfium2`：`.conda\Scripts\python.exe -m pip install pypdfium2`
-
-### 压缩包（zip / tar.gz）
-
-没有任何 LLM API 能直接吃 zip，所以 `/file data.zip` 会**在本地解包**，
-再按内容类型分发。模型看到的是「清单 + 各文件正文 + 包内图片」：
-
-```
-===== 压缩包 _z.zip（共 10 个条目：注入 4 个文本 / 1 张图片，跳过 5）=====
-  ✗ ../evil.txt（路径越界）
-  ✗ .git/config（噪声目录）
-  ✓ data/spec.csv（文本 36 字符）
-  ✓ figs/plot.png（图片 70B）
-  ✗ bin/model.pkl（二进制，跳过）
-  ✗ nested.tar.gz（嵌套压缩包，不递归）
-===== 清单结束 =====
-```
-
-安全与预算限制（全部有测试覆盖）：
-
-| 防护 | 阈值 | 说明 |
-|---|---|---|
-| zip slip | — | `../` 与绝对路径直接拒绝，且**从不落盘**（纯内存读取） |
-| zip bomb | 解压后 ≤256MB | 读任何字节**之前**用 `infolist()` 声明尺寸预检 |
-| 压缩包本体 | ≤64MB | |
-| 条目数 | ≤2000 | |
-| 注入文件数 | ≤60 | 超出的在清单里标 `✗` |
-| 单文件 | ≤20k 字符 | 超出截断并注明 |
-| 总注入量 | ≤120k 字符 | 与单个附件共用预算 |
-| 图片 | ≤8 张，单张 ≤12MB | 包内图片与直接上传共用上限 |
-
-跳过的内容一律在清单里写明原因（`二进制` / `噪声目录` / `路径越界` / `嵌套压缩包`），
-模型据此知道包里还有哪些东西没看到，不会误以为已经读全。
-
-`tar` / `tar.gz` / `tgz` / `tar.bz2` / `tar.xz` 同样支持，符号链接与硬链接跳过。
 
 ### 关于「模型支持图片，为什么不能直接传 PDF」
 
