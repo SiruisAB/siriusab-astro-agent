@@ -9,6 +9,7 @@
 天文agent/
 ├── main.py           Agent 主程序（四模式 + middleware 组装 + shell 审批）
 ├── tools.py          工具集（SIMBAD / 角距 / 地平坐标 / arXiv / ADS / 上下文压缩 / shell）
+├── viewer.py         终端查看器（/view 渲染 md·代码·csv·json，/tree 目录树）
 ├── requirements.txt  Python 依赖
 ├── .env.example      API 配置模板
 ├── sessions.db       会话持久记忆（自动生成，删掉即重置历史）
@@ -55,7 +56,8 @@ cp .env.example .env             # 然后编辑 .env，填入你的 API key
 
 每个模式是独立 agent 实例（提示词/工具/记忆各自独立）。交互命令：
 `/mode research`、`/mode chat`、`/mode`（查看全部）、`/model glm`（切换模型）、
-`/model`（查看模型档案）、`/help`；
+`/model`（查看模型档案）、`/view tools.py 10-50`（查看文件：代码高亮/md 渲染/csv 表格）、
+`/tree`（目录树）、`/help`；
 启动指定模式：`./.conda/python.exe main.py --mode research`（`--chat` 为简写），
 启动指定模型：`--model glm`。
 

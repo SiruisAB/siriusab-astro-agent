@@ -37,6 +37,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
 from tools import get_tools
+from viewer import list_tree, parse_range, view_file
 
 # ========== 各模式的系统提示词 ==========
 
@@ -152,6 +153,8 @@ HELP_TEXT = """
   /mode                             查看所有模式与当前选择
   /model [档案名]                   切换底层模型（档案在 .env 用 MODEL_NAME_<名字> 配置）
   /model                            查看已配置的模型档案与当前模型
+  /view <文件> [起始|起始-结束]     查看文件：md 渲染 / 代码高亮+行号 / csv 表格 / json
+  /tree [深度]                      树形查看项目目录（默认 2 层）
   /prompt <内容>                    为当前模式设置附加提示词（可有可无，叠加在默认提示词上）
   /prompt off                       清除当前模式的附加提示词
   /prompt                           查看当前模式的附加提示词
@@ -431,10 +434,20 @@ def handle_command(text: str, mode: str, custom_prompts: dict, ctx: dict | None 
             content = text.split(None, 1)[1].strip()
             custom_prompts[mode] = content
             print(f"已为 {mode} 模式设置附加提示词（对后续回答生效）:\n  {content}")
+    elif cmd == "/view":
+        rest = text.split(None, 1)
+        if len(rest) < 2:
+            print("用法: /view <文件> [起始行|起始-结束]    例: /view tools.py 100-150")
+        else:
+            args = rest[1].split()
+            view_file(args[0], parse_range(args[1]) if len(args) > 1 else None)
+    elif cmd == "/tree":
+        depth = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 2
+        list_tree(".", depth)
     elif cmd == "/help":
         print(HELP_TEXT)
     else:
-        print("未知命令。可用: /mode [模式名]、/model [档案名]、/prompt [内容]、/help")
+        print("未知命令。可用: /mode [模式名]、/model [档案名]、/view [文件]、/tree、/prompt [内容]、/help")
     return mode
 
 
