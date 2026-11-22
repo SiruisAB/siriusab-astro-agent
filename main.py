@@ -25,6 +25,7 @@ import os
 import re
 import sqlite3
 import sys
+import zipfile
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -144,6 +145,11 @@ _ATTACH_TEXT_SUFFIXES = {
 }
 _ATTACH_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _ATTACH_PDF_SUFFIXES = {".pdf"}
+
+# Office OOXML（docx/xlsx/pptx）本质是 zip 容器，必须按文档提取而不是解包注入。
+# 按内部结构判定真实类型（word/ xl/ ppt/ 目录 + [Content_Types].xml），
+# 所以改名的 docx.txt 也能被正确识别。
+_OOXML_SUFFIXES = {".docx", ".xlsx", ".pptx"}
 
 _ATTACH_MAX_CHARS = 60_000       # 单个文本文件注入上限（超出截断并注明）
 _ATTACH_TOTAL_CHARS = 120_000    # 一次提问所有文本附件总量上限
@@ -414,6 +420,116 @@ def _pdf_from_bytes(data: bytes, name: str) -> dict:
         return {"ok": False, "note": f"{name} PDF 解析失败: {e}"}
 
 
+def _ooxml_kind(data: bytes) -> str | None:
+    """按内部结构判定 OOXML 真实类型：docx / xlsx / pptx / None。
+
+    PK\x03\x04 头同时属于普通 zip 和 OOXML，单看文件头无法区分；
+    OOXML 的标志是根目录有 [Content_Types].xml 加对应前缀的部件目录。
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            names = z.namelist()
+    except Exception:
+        return None
+    if "[Content_Types].xml" not in names:
+        return None
+    if any(n.startswith("word/") for n in names):
+        return "docx"
+    if any(n.startswith("xl/") for n in names):
+        return "xlsx"
+    if any(n.startswith("ppt/") for n in names):
+        return "pptx"
+    return None
+
+
+def _docx_text(data: bytes, name: str) -> dict:
+    """提取 Word：正文段落 + 表格（行内单元格用制表符连接）。"""
+    try:
+        from docx import Document
+    except ImportError:
+        return {"ok": False, "note": f"{name} 需要 python-docx："
+                                     ".conda\\Scripts\\python.exe -m pip install python-docx"}
+    try:
+        doc = Document(io.BytesIO(data))
+        parts = [t.strip() for t in (p.text for p in doc.paragraphs) if t]
+        for tb in doc.tables:
+            for row in tb.rows:
+                cells = [c.text.strip() for c in row.cells]
+                if any(cells):
+                    parts.append("\t".join(cells))
+        text = "\n".join(parts)
+        return {"ok": True, "kind": "text", "text": text,
+                "note": (f"Word，{len(doc.paragraphs)} 段 {len(doc.tables)} 表，"
+                         f"提取 {len(text)} 字符")}
+    except Exception as e:
+        return {"ok": False, "note": f"{name} Word 解析失败: {e}"}
+
+
+def _xlsx_text(data: bytes, name: str) -> dict:
+    """提取 Excel：逐工作表逐行，空行跳过，单元格用制表符连接。"""
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        return {"ok": False, "note": f"{name} 需要 openpyxl："
+                                     ".conda\\Scripts\\python.exe -m pip install openpyxl"}
+    try:
+        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        lines = []
+        for ws in wb.worksheets:
+            lines.append(f"[工作表 {ws.title}]")
+            for row in ws.iter_rows(values_only=True):
+                vals = ["" if v is None else str(v) for v in row]
+                if any(vals):
+                    lines.append("\t".join(vals))
+        text = "\n".join(lines)
+        return {"ok": True, "kind": "text", "text": text,
+                "note": f"Excel，{len(wb.worksheets)} 个工作表，提取 {len(text)} 字符"}
+    except Exception as e:
+        return {"ok": False, "note": f"{name} Excel 解析失败: {e}"}
+
+
+def _pptx_text(data: bytes, name: str) -> dict:
+    """提取 PPT：逐幻灯片收集文本框与表格。"""
+    try:
+        from pptx import Presentation
+    except ImportError:
+        return {"ok": False, "note": f"{name} 需要 python-pptx："
+                                     ".conda\\Scripts\\python.exe -m pip install python-pptx"}
+    try:
+        prs = Presentation(io.BytesIO(data))
+        lines = []
+        for i, slide in enumerate(prs.slides, 1):
+            lines.append(f"[幻灯片 {i}]")
+            for shape in slide.shapes:
+                if getattr(shape, "has_text_frame", False):
+                    t = shape.text_frame.text.strip()
+                    if t:
+                        lines.append(t)
+                if getattr(shape, "has_table", False):
+                    for row in shape.table.rows:
+                        cells = [c.text.strip() for c in row.cells]
+                        if any(cells):
+                            lines.append("\t".join(cells))
+        text = "\n".join(lines)
+        n = sum(1 for _ in prs.slides)
+        return {"ok": True, "kind": "text", "text": text,
+                "note": f"PPT，{n} 页幻灯片，提取 {len(text)} 字符"}
+    except Exception as e:
+        return {"ok": False, "note": f"{name} PPT 解析失败: {e}"}
+
+
+def _ooxml_extract(data: bytes, name: str) -> dict:
+    """OOXML 提取分发。note 不含文件名（调用方决定怎么拼）。"""
+    kind = _ooxml_kind(data)
+    if kind == "docx":
+        return _docx_text(data, name)
+    if kind == "xlsx":
+        return _xlsx_text(data, name)
+    if kind == "pptx":
+        return _pptx_text(data, name)
+    return {"ok": False, "note": f"{name} 不是可识别的 OOXML 文档"}
+
+
 def _read_archive(path: Path) -> dict:
     """解包压缩包，把里面的文本/图片整理成可注入的结构（纯内存，不落盘）。"""
     import io
@@ -512,6 +628,17 @@ def _read_archive(path: Path) -> dict:
                     if len(images) < _ATTACH_MAX_IMAGES:
                         images.append({"name": img["name"], "data_url": img["data_url"]})
                 manifest_lines.append(f"  ✓ {name}（PDF 渲染 {len(got['images'])} 页）")
+        elif data[:4] == b"PK\x03\x04" and _ooxml_kind(data):
+            got = _ooxml_extract(data, name)
+            if got["ok"]:
+                text = got["text"]
+                if len(text) > _ARCHIVE_MAX_FILE_CHARS:
+                    text = text[:_ARCHIVE_MAX_FILE_CHARS] + "\n...(文件过长已截断)"
+                texts.append({"name": name, "text": text})
+                manifest_lines.append(f"  ✓ {name}（{got['note']}）")
+            else:
+                manifest_lines.append(f"  ✗ {got['note']}")
+                skipped += 1
         elif _is_archive_name(name):
             # 先判嵌套压缩包：它们本身是二进制，但原因要说清（不递归解包）
             manifest_lines.append(f"  ✗ {name}（嵌套压缩包，不递归）")
@@ -579,8 +706,21 @@ def _read_attachment(path_str: str) -> dict:
                      f"{size} 字节；可用 python 扫描 PK\\x03\\x04 提取）"),
         }
 
-    # 扩展名与真实内容不一致时以内容为准（例如 zip 被改名成 .txt）
+    # OOXML（docx/xlsx/pptx）本质是 zip，但必须按文档提取，优先于压缩包处理
     sniffed = _sniff_kind(p)
+    if sniffed == "archive" or suffix in _OOXML_SUFFIXES:
+        data = p.read_bytes()
+        okind = _ooxml_kind(data)
+        if okind:
+            got = _ooxml_extract(data, p.name)
+            if not got["ok"]:
+                return {"ok": False, "path": str(p), "note": got["note"]}
+            if suffix not in _OOXML_SUFFIXES:
+                got["note"] += f"（按文件头识别：扩展名 {suffix or '无'} 与内容不符）"
+            return {"ok": True, "path": str(p), "kind": "text",
+                    "text": got["text"], "note": got["note"]}
+
+    # 扩展名与真实内容不一致时以内容为准（例如 zip 被改名成 .txt）
     corrected = None
     if sniffed == "archive" and not _is_archive_name(p.name):
         corrected = "archive"

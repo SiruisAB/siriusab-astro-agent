@@ -69,6 +69,7 @@ chat 模式原本没有任何文件通道——它的循环不走 agent graph，
 | PDF（`PDF_MODE=image`） | 每页渲染成 PNG 走视觉通道 | **通用**：中转站也能用，能读扫描件/表格/公式 |
 | 任意文件（`SANDBOX_MODE=1`） | 包成 PNG+原字节 polyglot 送进对方沙箱 | 模型用 python 自己解；不占上下文 token |
 | 压缩包 zip / tar / tar.gz / tgz | 本地解包后逐个分发：文本注入、图片转多模态块 | 二进制/噪声目录/嵌套包跳过；清单告诉模型包里有什么 |
+| Office docx / xlsx / pptx（独立或压缩包内） | python-docx / openpyxl / python-pptx 提取段落、表格、单元格、幻灯片文本 | 本质是 zip，按内部结构（word/ xl/ ppt/）判定，改名也能处理；缺库时提示安装 |
 
 ### 上传方向：polyglot 投递（`SANDBOX_MODE=1`）
 

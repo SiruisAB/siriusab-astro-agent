@@ -16,3 +16,8 @@ pypdf>=4.0
 
 # 可选：PDF_MODE=image 时需要（把 PDF 页渲染成 PNG）
 pypdfium2>=4.0
+
+# Office 文档提取（/file 与压缩包内的 docx/xlsx/pptx）
+python-docx>=1.1
+openpyxl>=3.1
+python-pptx>=0.6
