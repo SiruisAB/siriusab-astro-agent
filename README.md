@@ -9,7 +9,8 @@
 ## 快速开始
 
 ```bat
-启动.bat                 :: 默认对话式界面（ctrl+q 退出）
+启动.bat                 :: 打开本地工作台
+启动.bat --tui           :: 打开原来的终端界面（Ctrl+Q 退出）
 启动.bat --repl          :: 旧式逐行交互
 启动.bat --mode research :: 直接进科研构思模式
 启动.bat --model glm     :: 指定模型档案
@@ -21,6 +22,16 @@
 E:\anaconda3\python.exe -m venv .conda
 .\.conda\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+### 工作台
+
+启动后，左侧可以切换**任务**和 **Chat**，中间查看流式会话，右侧查看执行记录、处理命令审批或浏览工作区文件。
+
+- **任务**提供通用 Agent、科研构思和代码工程三种模式。任务会话按模式保存在 `.workbench/`。
+- **Chat**直接读取原来 `sessions.db` 中的聊天记录。可以在右侧打开工作区文件，把支持的文件附加到下一条消息。
+- 默认用 Microsoft Edge 应用窗口打开，找不到 Edge 时用系统默认浏览器。工作台只监听 `127.0.0.1:8765`。也可以运行 `.\.conda\python.exe workspace.py --port 8766 --open` 指定端口。
+- 拖动分栏线调整宽度，双击还原默认宽度。打开文件会显示可放大的代码高亮预览，窄窗口下使用覆盖面板。
+- 输入框下显示最近一次模型调用的平均输出速率、输入 token 和缓存读取。可在 `.env` 设置 `CONTEXT_WINDOW` 或 `CONTEXT_WINDOW_<档案名>` 来显示上下文占比。如果兼容端点拒绝流式用量参数，可为对应档案设置 `STREAM_USAGE=0` 或 `STREAM_USAGE_<档案名>=0`。
 
 ## 配置（.env）
 
@@ -424,7 +435,6 @@ sessions.db，**重启程序历史不丢**，标题取首句提问（可用 `/se
 
 ## 已知限制
 
-- `chat` 模式历史存在内存，**重启即丢**（另三模式走 `sessions.db` 持久）
 - `browser.py` 内嵌终端直接调 PowerShell，**不走审批**，与主审批链独立
 - 无 License、无测试、无 CI；上游仅 1 次提交
 
@@ -434,6 +444,8 @@ sessions.db，**重启程序历史不丢**，标题取首句提问（可用 `/se
 astro-agent/
 ├── 启动.bat         启动脚本
 ├── main.py          四模式 + middleware 装配 + shell 审批 + 入口
+├── workspace.py     本地工作台服务
+├── workbench_ui/    工作台界面
 ├── chatui.py        Textual 对话界面（流式、折叠块、审批内联、多会话侧栏）
 ├── chatstore.py     chat 多会话存储（sessions.db 内两表，重启不丢）
 ├── tools.py         10 个工具 + 三层上下文管理

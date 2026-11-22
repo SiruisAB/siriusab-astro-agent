@@ -17,6 +17,10 @@ if not exist ".env" (
     pause
     exit /b 1
 )
-echo 启动天文 Agent（对话界面，ctrl+q 退出）...
-"%PY%" main.py %*
+if "%~1"=="" (
+    echo 启动天文 Agent 工作台…
+    "%PY%" workspace.py --open
+) else (
+    "%PY%" main.py %*
+)
 pause

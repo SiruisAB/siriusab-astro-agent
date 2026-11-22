@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>天文 Agent</title>
+  <link rel="stylesheet" href="/ui/style.css">
+  <script src="/ui/app.js" defer></script>
+</head>
+<body>
+  <div class="app">
+    <aside class="rail" id="sidebar" aria-label="会话">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">✧</span><span>天文 Agent</span></div>
+      <nav class="nav" aria-label="工作模式">
+        <button class="nav-item" id="nav-task" aria-pressed="true"><span aria-hidden="true">◇</span>任务</button>
+        <button class="nav-item" id="nav-chat" aria-pressed="false"><span aria-hidden="true">◌</span>Chat</button>
+      </nav>
+      <div class="history-head"><h2>会话</h2><button id="new" class="icon" aria-label="新建会话" title="新建会话">＋</button></div>
+      <div id="sessions" class="sessions"></div>
+      <div class="root-label"><span class="status-dot"></span><span id="root">本地工作区</span></div>
+    </aside>
+    <div class="splitter" id="split-rail" role="separator" aria-orientation="vertical" aria-label="???????" aria-controls="sidebar" tabindex="0"></div>
+    <main class="main">
+      <header class="top">
+        <button class="icon mobile-toggle" id="sidebar-toggle" aria-expanded="false" aria-controls="sidebar" aria-label="会话">☰</button>
+        <h1 id="title">新任务</h1>
+        <span id="status" role="status" class="status"></span>
+        <button id="panel-toggle" class="icon" aria-expanded="true" aria-controls="panel" aria-label="显示或隐藏工作区" title="工作区">▤</button>
+      </header>
+      <div id="timeline" class="timeline" tabindex="0" aria-label="对话消息">
+        <div class="stream">
+          <section id="welcome" class="welcome">
+            <div class="welcome-icon" aria-hidden="true">✧</div>
+            <h2 id="welcome-title">今天想研究什么？</h2>
+            <p id="welcome-text">让 Agent 检索资料、分析数据或处理工作区文件。</p>
+            <div id="suggestions" class="suggestions"></div>
+          </section>
+          <div id="messages" class="messages"></div>
+        </div>
+      </div>
+      <div class="composer-wrap">
+        <form id="composer" class="composer">
+          <div id="attachments" class="attachments" hidden></div>
+          <textarea id="prompt" rows="3" maxlength="48000" placeholder="描述你要完成的任务…" aria-label="输入消息"></textarea>
+          <div class="composer-controls">
+            <select id="mode" aria-label="任务模式">
+              <option value="agent">通用 Agent</option>
+              <option value="research">科研构思</option>
+              <option value="code">代码工程</option>
+            </select>
+            <select id="model" aria-label="模型"></select>
+            <div class="spacer"></div>
+            <button type="submit" id="send" class="send" aria-label="发送" title="发送（Enter）">↑</button>
+          </div>
+        </form>
+        <div class="usage" aria-label="??????????">
+          <span title="?? token ???????????? token ??">?? <output id="usage-rate">?</output></span>
+          <span title="??????????? token ????????????">??? <output id="usage-context">?</output></span>
+          <span title="???? token ?????? token ???">???? <output id="usage-cache">?</output></span>
+        </div>
+        <p class="hint" id="hint"></p>
+      </div>
+    </main>
+    <div class="splitter" id="split-panel" role="separator" aria-orientation="vertical" aria-label="????????" aria-controls="panel" tabindex="0"></div>
+    <aside id="panel" class="panel" aria-label="工作区">
+      <div class="panel-tabs" aria-label="工作区内容">
+        <button id="activity-tab" aria-pressed="true" aria-controls="activity">执行记录</button>
+        <button id="files-tab" aria-pressed="false" aria-controls="files">文件</button>
+      </div>
+      <div id="activity" class="panel-body"><p class="muted" id="activity-empty">提交任务后，这里会显示执行进度和审批请求。</p><div id="events" class="events"></div></div>
+      <div id="files" class="panel-body" hidden>
+        <div class="file-head"><span id="folder" class="mono">/</span><button id="up" class="icon" type="button" aria-label="上一级目录" title="上一级目录">↰</button><button id="refresh" class="icon" type="button" aria-label="刷新文件" title="刷新文件">↻</button></div>
+        <div id="file-list" class="file-list"></div>
+      </div>
+    </aside>
+    <div class="splitter" id="split-viewer" role="separator" aria-orientation="vertical" aria-label="???????" aria-controls="viewer" tabindex="0"></div>
+    <aside id="viewer" class="viewer" aria-label="????" hidden>
+      <div class="preview-head">
+        <span id="filename" class="mono"></span>
+        <button id="attach" type="button" class="small-button" hidden>??</button>
+        <button id="viewer-expand" type="button" class="icon" aria-label="????" aria-pressed="false" title="????">?</button>
+        <button id="viewer-close" type="button" class="icon" aria-label="????" title="????">?</button>
+      </div>
+      <p id="preview-status" class="muted" hidden></p>
+      <pre id="file-text" tabindex="0" aria-label="????" hidden></pre>
+    </aside>
+  </div>
+</body>
+</html>

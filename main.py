@@ -47,7 +47,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
-from chatstore import PLACEHOLDER_TITLE, ChatStore
+from chatstore import PLACEHOLDER_TITLE, ChatHistoryChanged, ChatStore
 from tools import get_tools
 from viewer import list_tree, parse_range, view_file
 
@@ -1172,7 +1172,7 @@ def list_model_profiles() -> dict:
     return profiles
 
 
-def build_model(profile: dict | None = None) -> ChatOpenAI:
+def build_model(profile: dict | None = None, *, model_class=ChatOpenAI, **options) -> ChatOpenAI:
     """构建模型实例（OpenAI 兼容协议）。profile 缺省时读 .env 主档案。"""
     load_dotenv()
     if profile is None:
@@ -1186,11 +1186,12 @@ def build_model(profile: dict | None = None) -> ChatOpenAI:
             f"模型档案 {profile.get('model', '?')} 缺少 API_KEY"
             "（检查 .env 中的 API_KEY 或 API_KEY_<档案名>）"
         )
-    return ChatOpenAI(
+    options.setdefault("temperature", 0)
+    return model_class(
         model=profile["model"],
         api_key=profile["api_key"],
         base_url=profile.get("base_url") or None,  # OpenAI 官方可不填
-        temperature=0,  # 天文数据要准确，不发挥
+        **options,
     )
 
 
@@ -1208,7 +1209,7 @@ def _get_checkpointer() -> SqliteSaver:
     return _CHECKPOINTER
 
 
-def build_agent(model: ChatOpenAI, mode: str, custom_prompt: str = ""):
+def build_agent(model: ChatOpenAI, mode: str, custom_prompt: str = "", *, checkpointer=None):
     """构建指定模式的 agent 实例，返回 (agent, config)。各模式记忆独立。
 
     middleware 组合（全部现成组件）：
@@ -1247,7 +1248,7 @@ def build_agent(model: ChatOpenAI, mode: str, custom_prompt: str = ""):
                 keep=("messages", 20),
             ),
         ],
-        checkpointer=_get_checkpointer(),
+        checkpointer=_get_checkpointer() if checkpointer is None else checkpointer,
     )
     # 每个模式独立 thread_id，对话记忆互不污染
     return agent, {"configurable": {"thread_id": f"mode-{mode}"}}
@@ -1359,7 +1360,6 @@ def chat_reply(
     # 本轮真正发给模型的消息（含附件全文/图片），与写进历史的轻量版分开
     human_now = HumanMessage(content=_compose_question(question, attach,
                                                         profile_name=profile_name))
-    chat_history.append(HumanMessage(content=_history_note(question, attach)))
     trace: list = []
     thinking = {"draft": None, "trace": trace, "reasoning": ""}
     if os.environ.get("CHAT_TWO_STAGE", "1").lower() in ("0", "false", "no", "off"):
@@ -1367,7 +1367,7 @@ def chat_reply(
         reply, thinking["reasoning"] = _chat_loop(
             model,
             compose_system(CHAT_PROMPT, custom_prompt),
-            [*chat_history[:-1], human_now],  # 历史 + 含附件的本次提问
+            [*chat_history, human_now],  # 历史 + 含附件的本次提问
             tools,
             trace=trace,
             on_delta=on_answer,
@@ -1397,7 +1397,7 @@ def chat_reply(
             model,
             compose_system(CHAT_PROMPT, custom_prompt),
             [
-                *chat_history[:-1],  # 此前的对话历史
+                *chat_history,  # 此前的对话历史
                 HumanMessage(content=_compose_question(
                     question, text_attach,
                     extra=stage2_extra,
@@ -1408,7 +1408,40 @@ def chat_reply(
             trace=trace,
             on_delta=on_answer,
         )
-    chat_history.append(AIMessage(content=reply))
+    chat_history.extend([
+        HumanMessage(content=_history_note(question, attach)),
+        AIMessage(content=reply),
+    ])
+    return reply, thinking
+
+
+def session_chat_reply(ctx: dict, question: str, *, on_draft=None, on_answer=None):
+    """执行一轮 chat，保存成功后再更新供界面和下一轮使用的内存历史。"""
+    history = ctx["chat_history"]
+    history_size = len(history)
+    store = ctx.get("store")
+    sid = ctx.get("session_id")
+    updated_history = history.copy()
+    reply, thinking = chat_reply(
+        session_model(ctx), updated_history, question,
+        custom_prompt=ctx["custom_prompts"].get("chat", ""),
+        attachments=ctx.get("attachments"),
+        on_draft=on_draft,
+        on_answer=on_answer,
+        profile_name=ctx.get("current"),
+    )
+    if store is not None:
+        saved_count = ctx["saved_message_count"]
+        try:
+            store.replace_messages(sid, updated_history, first_question=question,
+                                   expected_count=saved_count)
+        except ChatHistoryChanged:
+            pending = history[saved_count:]
+            load_chat_session(ctx, sid)
+            history.extend(pending)
+            raise
+        ctx["saved_message_count"] = len(updated_history)
+    history.extend(updated_history[history_size:])
     return reply, thinking
 
 
@@ -1473,6 +1506,9 @@ def session_model(ctx: dict):
     cache = ctx.setdefault("session_models", {})
     if key not in cache:
         profile = ctx["profiles"].get(ctx.get("current"), {})
+        if "model_factory" in ctx:
+            cache[key] = ctx["model_factory"](**params)
+            return cache[key]
         cache[key] = ChatOpenAI(
             model=profile.get("model", "gpt-4o-mini"),
             api_key=profile.get("api_key"),
@@ -1480,6 +1516,13 @@ def session_model(ctx: dict):
             **params,
         )
     return cache[key]
+
+
+def load_chat_session(ctx: dict, sid: str) -> None:
+    messages = ctx["store"].load_messages(sid)
+    ctx["session_id"] = sid
+    ctx["chat_history"][:] = messages
+    ctx["saved_message_count"] = len(messages)
 
 
 def session_command(text: str, ctx: dict) -> str:
@@ -1497,8 +1540,7 @@ def session_command(text: str, ctx: dict) -> str:
     if sub == "new":
         rest = text.split(None, 2)
         title = rest[2].strip() if len(rest) > 2 else PLACEHOLDER_TITLE
-        ctx["session_id"] = store.create_session(title)
-        ctx["chat_history"].clear()
+        load_chat_session(ctx, store.create_session(title))
         return f"已创建并切换到新会话：{store.get_title(ctx['session_id'])}"
 
     if sub == "rename":
@@ -1520,13 +1562,10 @@ def session_command(text: str, ctx: dict) -> str:
         if victim["id"] == ctx["session_id"]:  # 删的是当前会话 → 换到最近一个
             rest = store.list_sessions()
             if rest:
-                ctx["session_id"] = rest[0]["id"]
-                ctx["chat_history"].clear()
-                ctx["chat_history"].extend(store.load_messages(ctx["session_id"]))
+                load_chat_session(ctx, rest[0]["id"])
                 return (f"已删除会话「{victim['title']}」，切换到最近会话"
                         f"「{rest[0]['title']}」（{len(rest)-1} 个会话剩余）")
-            ctx["session_id"] = store.create_session()
-            ctx["chat_history"].clear()
+            load_chat_session(ctx, store.create_session())
             return f"已删除最后一个会话，已创建新会话"
         return f"已删除会话「{victim['title']}」"
 
@@ -1537,9 +1576,7 @@ def session_command(text: str, ctx: dict) -> str:
             return f"编号超出范围（当前 {len(sessions)} 个会话）"
         target = sessions[idx]
         if target["id"] != ctx["session_id"]:
-            ctx["session_id"] = target["id"]
-            ctx["chat_history"].clear()
-            ctx["chat_history"].extend(store.load_messages(target["id"]))
+            load_chat_session(ctx, target["id"])
             return f"已切换到会话 {idx + 1}：「{target['title']}」（{len(ctx['chat_history'])} 条消息）"
         return f"当前就在会话 {idx + 1}：「{target['title']}」"
 
@@ -1778,6 +1815,7 @@ def main():
         "store": store,  # chat 多会话存储
         "session_id": session_id,
         "chat_history": chat_history,
+        "saved_message_count": len(chat_history),  # 不含尚未保存的模型交接说明
         "custom_prompts": custom_prompts,
         "attachments": [],  # chat 模式的待附加文件（/file 管理）
     }
@@ -1795,7 +1833,6 @@ def main():
 def _repl(mode: str, ctx: dict) -> None:
     """旧式逐行交互（--repl 启动）。默认入口是对话式界面（chatui）。"""
     custom_prompts = ctx["custom_prompts"]
-    chat_history = ctx["chat_history"]
     agents = ctx["agents"]
 
     print("=== 天文 Agent（REPL 模式）===")
@@ -1820,16 +1857,8 @@ def _repl(mode: str, ctx: dict) -> None:
             continue
         try:
             if mode == "chat":
-                reply, _ = chat_reply(
-                    session_model(ctx), chat_history, question, custom_prompts.get("chat", ""),
-                    attachments=ctx.get("attachments") or [],
-                    profile_name=ctx.get("current"),
-                )
+                reply, _ = session_chat_reply(ctx, question)
                 print(f"\n天文Agent: {reply}\n")
-                _store = ctx.get("store")
-                if _store:  # 多会话持久化 + 首问自动命名
-                    _store.replace_messages(ctx["session_id"], chat_history)
-                    _store.auto_title(ctx["session_id"], question)
                 if _artifact_auto_fetch(ctx.get("current")):
                     try:
                         note = artifact_note(fetch_artifacts(reply))

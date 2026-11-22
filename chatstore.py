@@ -5,7 +5,8 @@
   多模态块只存文本部分，历史里本来就是轻量版）
 
 与 SqliteSaver 共用 sessions.db（agent 模式的 checkpoint 也在里面，互不冲突）。
-写路径用 replace_messages 全量重写——单会话消息量小，简单可靠优先。
+写路径用 replace_messages 保存快照。对话轮次校验已存历史的位置后，
+只追加新消息，防止多个窗口互相覆盖。
 连接允许跨线程（chatui 的 worker 线程写），WAL + timeout 降低与 SqliteSaver
 并发时的锁冲突概率；所有连接用 closing() 显式关闭，不留文件锁。
 """
@@ -40,6 +41,10 @@ PLACEHOLDER_TITLE = "新会话"
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+class ChatHistoryChanged(RuntimeError):
+    """另一窗口已保存新消息，当前回复基于旧历史。"""
 
 
 class ChatStore:
@@ -126,14 +131,6 @@ class ChatStore:
                 (json.dumps(params, ensure_ascii=False), _now(), sid),
             )
 
-    def auto_title(self, sid: str, first_question: str) -> None:
-        """还是占位标题时，用第一句提问自动命名（取首行截 24 字）。"""
-        if self.get_title(sid) != PLACEHOLDER_TITLE:
-            return
-        line = (first_question or "").strip().splitlines()[0].strip()
-        if line:
-            self.rename_session(sid, line[:24])
-
     # ---------- 消息 ----------
 
     def load_messages(self, sid: str) -> list:
@@ -152,19 +149,46 @@ class ChatStore:
                 out.append(AIMessage(content=content))
         return out
 
-    def replace_messages(self, sid: str, messages: list) -> None:
-        """全量重写某会话的消息（调用方在每轮回答后调用一次）。"""
-        now = _now()
+    def replace_messages(
+        self, sid: str, messages: list, *, first_question: str = "",
+        expected_count: int | None = None,
+    ) -> None:
+        """保存消息和元数据。指定 expected_count 时校验位置，仅追加新消息。"""
+        lines = first_question.strip().splitlines()
+        title = lines[0].strip()[:24] if lines else ""
         with closing(self._conn()) as db, db:
-            db.execute("DELETE FROM chat_messages WHERE session_id = ?", (sid,))
-            for i, m in enumerate(messages):
-                role = "human" if isinstance(m, HumanMessage) else "ai"
-                db.execute(
-                    "INSERT INTO chat_messages (session_id, idx, role, content)"
-                    " VALUES (?, ?, ?, ?)",
-                    (sid, i, role, str(m.content)),
-                )
-            db.execute(
-                "UPDATE chat_sessions SET updated = ? WHERE session_id = ?",
-                (now, sid),
+            updated = db.execute(
+                """UPDATE chat_sessions SET updated = ?, title = CASE
+                       WHEN title = ? AND ? <> '' THEN ? ELSE title END
+                   WHERE session_id = ?""",
+                (_now(), PLACEHOLDER_TITLE, title, title, sid),
             )
+            if updated.rowcount == 0:
+                raise LookupError(f"会话不存在：{sid}")
+            start = 0
+            if expected_count is not None:
+                # 上面的 UPDATE 已持有写锁，校验与追加之间没有并发写入。
+                (next_index,) = db.execute(
+                    "SELECT COALESCE(MAX(idx) + 1, 0) FROM chat_messages WHERE session_id = ?",
+                    (sid,),
+                ).fetchone()
+                if next_index != expected_count:
+                    raise ChatHistoryChanged("会话已在其他窗口更新，请重新发送本次提问。")
+                if expected_count > len(messages):
+                    raise ValueError("追加保存时不能缩短历史")
+                start = expected_count
+            db.executemany(
+                """INSERT INTO chat_messages (session_id, idx, role, content)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT (session_id, idx) DO UPDATE
+                   SET role = excluded.role, content = excluded.content
+                   WHERE chat_messages.role <> excluded.role
+                      OR chat_messages.content <> excluded.content""",
+                ((sid, i, "human" if isinstance(m, HumanMessage) else "ai", str(m.content))
+                 for i, m in enumerate(messages[start:], start)),
+            )
+            if expected_count is None:
+                db.execute(
+                    "DELETE FROM chat_messages WHERE session_id = ? AND idx >= ?",
+                    (sid, len(messages)),
+                )
