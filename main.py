@@ -1,5 +1,7 @@
 """天文 Agent 主程序。
 
+默认启动对话式界面（chatui，LM Studio 风格）；--repl 切换为旧式逐行交互。
+
 四种模式（运行中用 /mode 切换，或启动时 --mode <名称>，--chat 等价于 --mode chat）：
 
 - agent    通用模式：查天体数据、算坐标、执行 shell（需审批），工具循环
@@ -281,61 +283,87 @@ def build_agent(model: ChatOpenAI, mode: str, custom_prompt: str = ""):
 CHAT_MAX_TOOL_ROUNDS = 6  # 两阶段各自的工具调用轮数上限，防止失控
 
 
+def _msg_reasoning(resp) -> str:
+    """提取模型自带的思考过程（deepseek-reasoner / GLM thinking 等返回的 reasoning_content）。"""
+    kw = getattr(resp, "additional_kwargs", {}) or {}
+    r = kw.get("reasoning_content")
+    return r.strip() if isinstance(r, str) and r.strip() else ""
+
+
 def _chat_loop(
-    model: ChatOpenAI, system_content: str, messages: list, tools: list
-) -> str:
+    model: ChatOpenAI, system_content: str, messages: list, tools: list, trace: list | None = None
+):
     """chat 模式的内部对话循环：模型可自主调用文献/数据检索工具。
 
     与 agent 模式的区别：只挂查询+文献类工具（无 shell），轮数有上限，
     整个循环的中间过程（工具调用与结果）不进入对话历史。
+    trace 传入列表时记录每次工具调用（对话界面展示思考过程用）。
+    返回 (回复文本, reasoning_content 或 "")。
     """
     if not tools:
-        return model.invoke([SystemMessage(content=system_content), *messages]).content
+        resp = model.invoke([SystemMessage(content=system_content), *messages])
+        return resp.content, _msg_reasoning(resp)
     model_bt = model.bind_tools(tools)
     by_name = {t.name: t for t in tools}
     convo = [SystemMessage(content=system_content), *messages]
     resp = None
+    reasoning = ""
     for _ in range(CHAT_MAX_TOOL_ROUNDS):
         resp = model_bt.invoke(convo)
+        reasoning = _msg_reasoning(resp) or reasoning
         if not getattr(resp, "tool_calls", None):
-            return resp.content
+            return resp.content, reasoning
         convo.append(resp)
         for tc in resp.tool_calls:
             tool = by_name.get(tc["name"])
             result = tool.invoke(tc["args"]) if tool else f"未知工具: {tc['name']}"
             convo.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
-    return resp.content if resp else ""  # 轮数上限兜底
+            if trace is not None:
+                trace.append({
+                    "tool": tc["name"],
+                    "args": {k: str(v)[:80] for k, v in (tc["args"] or {}).items()},
+                    "result": str(result)[:150],
+                })
+    return (resp.content if resp else ""), reasoning  # 轮数上限兜底
 
 
 def chat_reply(
     model: ChatOpenAI, chat_history: list, question: str, custom_prompt: str = ""
-) -> str:
+):
     """学术问答模式：两阶段生成，两阶段均可自主调用文献/数据检索工具。
 
     对用户而言仍是一次性输出；草稿与工具调用的中间过程不进入对话历史。
     custom_prompt 为可选附加提示词，草稿和终答阶段都会叠加。
     环境变量 CHAT_TWO_STAGE=0 时切换为单阶段直答（1~2 次模型调用，更省）。
+    返回 (回复文本, 思考过程 dict)：
+    thinking = {"draft": 两阶段草稿或 None, "trace": 工具调用轨迹,
+                "reasoning": 模型自带 reasoning_content 或 ""}
     """
     tools = get_tools("query")  # 查询类 + 文献类（arXiv/ADS），无 shell
     chat_history.append(HumanMessage(content=question))
+    trace: list = []
+    thinking = {"draft": None, "trace": trace, "reasoning": ""}
     if os.environ.get("CHAT_TWO_STAGE", "1").lower() in ("0", "false", "no", "off"):
         # 单阶段直答：一次调用，模型仍可自主查文献/数据
-        reply = _chat_loop(
+        reply, thinking["reasoning"] = _chat_loop(
             model,
             compose_system(CHAT_PROMPT, custom_prompt),
             list(chat_history),  # 全部历史 + 本次提问
             tools,
+            trace=trace,
         )
     else:
         # 阶段一：内部草稿，自由推理试错，可查文献/天体数据
-        draft = _chat_loop(
+        draft, _ = _chat_loop(
             model,
             compose_system(CHAT_DRAFT_PROMPT, custom_prompt),
             [HumanMessage(content=question)],
             tools,
+            trace=trace,
         )
+        thinking["draft"] = draft
         # 阶段二：基于草稿输出结构化、标注置信度的最终回答
-        reply = _chat_loop(
+        reply, thinking["reasoning"] = _chat_loop(
             model,
             compose_system(CHAT_PROMPT, custom_prompt),
             [
@@ -345,9 +373,10 @@ def chat_reply(
                 ),
             ],
             tools,
+            trace=trace,
         )
     chat_history.append(AIMessage(content=reply))
-    return reply
+    return reply, thinking
 
 
 def handle_command(text: str, mode: str, custom_prompts: dict, ctx: dict | None = None) -> str:
@@ -465,7 +494,8 @@ def main():
     agents = {}  # 模式名 -> (agent, config)，首次使用时懒创建
 
     # 启动参数：--chat 等价于 --mode chat；--mode <名称> 进入指定模式；
-    # --model <档案名> 指定初始模型；--prompt "<内容>" 为启动模式预置附加提示词
+    # --model <档案名> 指定初始模型；--prompt "<内容>" 为启动模式预置附加提示词；
+    # --repl 使用旧式逐行交互（默认是对话式界面）
     mode = "agent"
     if "--chat" in sys.argv:
         mode = "chat"
@@ -487,20 +517,34 @@ def main():
         if arg == "--prompt" and i + 1 < len(sys.argv):
             custom_prompts[mode] = sys.argv[i + 1]
 
-    chat_history: list = []  # chat 模式的独立历史
-
-    # /model 热切换所需的共享运行时状态（handle_command 直接修改其中的字段）
-    ctx = {
+    ctx = {  # 共享运行时状态：REPL 与对话界面共用，handle_command 直接修改其中的字段
         "profiles": profiles,
         "current": start_profile,
         "model": model,
         "agents": agents,
-        "chat_history": chat_history,
+        "chat_history": [],  # chat 模式的独立历史
+        "custom_prompts": custom_prompts,
     }
 
-    print("=== 天文 Agent ===")
-    cur_prof = profiles.get(start_profile, {})
-    print(f"当前模型: {start_profile} ({cur_prof.get('model', '?')})")
+    if "--repl" in sys.argv:
+        _repl(mode, ctx)
+        return
+    try:
+        from chatui import run_chat  # 懒导入：textual 缺失时给出可读提示
+    except ImportError as e:
+        raise SystemExit(f"对话界面需要 textual：./.conda/python.exe -m pip install textual\n({e})")
+    run_chat(mode, ctx)
+
+
+def _repl(mode: str, ctx: dict) -> None:
+    """旧式逐行交互（--repl 启动）。默认入口是对话式界面（chatui）。"""
+    custom_prompts = ctx["custom_prompts"]
+    chat_history = ctx["chat_history"]
+    agents = ctx["agents"]
+
+    print("=== 天文 Agent（REPL 模式）===")
+    cur_prof = ctx["profiles"].get(ctx["current"], {})
+    print(f"当前模型: {ctx['current']} ({cur_prof.get('model', '?')})")
     print(f"当前模式: {mode} — {MODE_CONFIGS[mode]['desc']}")
     if mode in custom_prompts:
         print(f"附加提示词: {custom_prompts[mode]}")
@@ -520,7 +564,7 @@ def main():
             continue
         try:
             if mode == "chat":
-                reply = chat_reply(ctx["model"], chat_history, question, custom_prompts.get("chat", ""))
+                reply, _ = chat_reply(ctx["model"], chat_history, question, custom_prompts.get("chat", ""))
                 print(f"\n天文Agent: {reply}\n")
             else:
                 # agent 实例懒创建；附加提示词或模型变化后自动重建（历史保留在同 thread_id）

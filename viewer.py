@@ -9,11 +9,12 @@
 import csv
 from pathlib import Path
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.json import JSON
 from rich.markdown import Markdown
 from rich.syntax import Syntax
 from rich.table import Table
+from rich.text import Text
 from rich.tree import Tree
 
 console = Console()
@@ -91,51 +92,54 @@ def to_renderable(path: Path, text: str, start_line: int = 1):
         return Syntax(text, "text", line_numbers=True, start_line=start_line, word_wrap=True)
 
 
-def view_file(path: str, lines: tuple[int, int] | None = None) -> None:
-    """按扩展名选择渲染方式查看文件。lines 为 (起始行, 结束行)，可选。"""
+def view_renderable(path: str, lines: tuple[int, int] | None = None):
+    """渲染对象接口（聊天界面 /browse 与 /view 共用）：不直接打印，返回 rich 渲染对象。"""
     p = _resolve(path)
     if not p.is_file():
-        console.print(f"[red]文件不存在: {p}[/red]")
-        console.print("[dim]提示: /tree 查看目录，/view results/xxx.md 查看落盘结果[/dim]")
-        return
+        return Text(f"文件不存在: {p}", style="red")
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
-        console.print(f"[red]读取失败: {e}[/red]")
-        return
+        return Text(f"读取失败: {e}", style="red")
+    return _render_from_text(p, text, lines)
 
+
+def _render_from_text(p: Path, text: str, lines: tuple[int, int] | None = None):
     suffix = p.suffix.lower()
     if suffix == ".csv":
         rows = _csv_rows(text)
         table = _csv_table(rows, p.name, row_range=lines)
         if table is None:
-            console.print("[dim]（空文件）[/dim]")
-            return
-        console.print(table)
+            return Text("（空文件）", style="dim")
         if not lines and len(rows) - 1 > MAX_CSV_ROWS:
-            console.print(f"[dim]… 仅显示前 {MAX_CSV_ROWS} 行；全部查看: /view {p.name} 1-{len(rows)}[/dim]")
-        return
-
+            return Group(
+                table,
+                Text(f"… 仅显示前 {MAX_CSV_ROWS} 行；全部查看: /view {p.name} 1-{len(rows)}", style="dim"),
+            )
+        return table
     start = lines[0] if lines else 1
     if lines:
         text = "\n".join(text.splitlines()[start - 1 : lines[1]])
+    return to_renderable(p, text, start_line=start)
 
-    renderable = to_renderable(p, text, start_line=start)
-    if suffix in TEXT_SUFFIXES or not suffix:
-        console.print(f"[dim]{p}[/dim]\n{renderable}")
-    else:
-        console.print(renderable)
+
+def view_file(path: str, lines: tuple[int, int] | None = None) -> None:
+    """按扩展名选择渲染方式查看文件（REPL 用）。lines 为 (起始行, 结束行)，可选。"""
+    console.print(view_renderable(path, lines))
+
+
+def make_tree(root: str = ".", depth: int = 2) -> Tree | Text:
+    """目录树渲染对象（/tree 与聊天界面共用）。"""
+    base = _resolve(root)
+    if not base.is_dir():
+        return Text(f"目录不存在: {base}", style="red")
+    tree = Tree(f"[bold blue]{base.name or base}[/bold blue]", guide_style="dim")
+    _fill(tree, base, depth)
+    return tree
 
 
 def list_tree(root: str = ".", depth: int = 2) -> None:
-    """树形展示目录（跳过环境/缓存目录，目录在前、按名排序）。"""
-    base = _resolve(root)
-    if not base.is_dir():
-        console.print(f"[red]目录不存在: {base}[/red]")
-        return
-    tree = Tree(f"[bold blue]{base.name or base}[/bold blue]", guide_style="dim")
-    _fill(tree, base, depth)
-    console.print(tree)
+    console.print(make_tree(root, depth))
 
 
 def _fill(node, directory: Path, depth: int) -> None:

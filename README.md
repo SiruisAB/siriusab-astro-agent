@@ -7,7 +7,8 @@
 
 ```
 天文agent/
-├── main.py           Agent 主程序（四模式 + middleware 组装 + shell 审批）
+├── main.py           Agent 主程序（四模式 + middleware 组装 + shell 审批 + 启动入口）
+├── chatui.py         对话式主界面（消息流 + 思考过程折叠收纳，LM Studio 风格）
 ├── tools.py          工具集（SIMBAD / 角距 / 地平坐标 / arXiv / ADS / 上下文压缩 / shell）
 ├── viewer.py         终端查看器（/view 渲染 md·代码·csv·json，/tree 目录树）
 ├── browser.py        双栏文件浏览器（/browse：左目录树右预览，Textual 实现）
@@ -29,7 +30,7 @@ conda create -p .conda -y python=3.12
 # 2. 配置模型
 cp .env.example .env             # 然后编辑 .env，填入你的 API key
 
-# 3. 运行
+# 3. 运行（默认对话式界面；--repl 切换为旧式逐行交互）
 ./.conda/python.exe main.py
 ```
 
@@ -55,13 +56,20 @@ cp .env.example .env             # 然后编辑 .env，填入你的 API key
 | `code` | 代码工程：文件工具优先（edit_file 精确替换）、最小修改、跑测试验证 | 全部 10 个 | 写脚本、调试、改本项目代码 |
 | `chat` | 两阶段深度思考后一次性输出，引用文献带 arXiv ID/bibcode | 查询+文献（无 shell） | 理论问答、概念辨析 |
 
-每个模式是独立 agent 实例（提示词/工具/记忆各自独立）。交互命令：
+每个模式是独立 agent 实例（提示词/工具/记忆各自独立）。
+
+**对话式界面（默认）**：消息按对话流排列，回答为 Markdown 渲染；思考过程默认收纳在
+可展开的折叠块里——推理模型的 `reasoning_content`、chat 模式的两阶段内部草稿、
+agent 的工具调用轨迹各成一块，点击展开。命令直接输入，`/browse` 以全屏打开
+（escape 返回），shell 审批在对话内完成（y/n/替代命令），`ctrl+q` 退出。
+
+交互命令：
 `/mode research`、`/mode chat`、`/mode`（查看全部）、`/model glm`（切换模型）、
 `/model`（查看模型档案）、`/view tools.py 10-50`（查看文件：代码高亮/md 渲染/csv 表格）、
 `/tree`（目录树）、`/browse`（双栏浏览器：左目录树右预览，t 呼出终端面板直接跑命令，
 q 退回对话）、`/help`；
 启动指定模式：`./.conda/python.exe main.py --mode research`（`--chat` 为简写），
-启动指定模型：`--model glm`。
+启动指定模型：`--model glm`，旧式逐行交互：`--repl`。
 
 ## 多模型热切换（/model）
 

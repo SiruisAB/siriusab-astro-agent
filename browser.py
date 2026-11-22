@@ -16,6 +16,7 @@ from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import Screen
 from textual.widgets import DirectoryTree, Footer, Input, RichLog, Static
 
 from viewer import EXCLUDE_DIRS, PROJECT_DIR, to_renderable
@@ -31,7 +32,13 @@ class ProjectTree(DirectoryTree):
         return [p for p in paths if p.name not in EXCLUDE_DIRS]
 
 
-class Browser(App):
+class BrowserScreen(Screen):
+    """双栏浏览器 + 终端面板。
+
+    作为 Screen 设计：既能被 chatui push（escape/q 返回对话），
+    也能由 _BrowserApp 独立运行（--repl 模式的 /browse）。
+    """
+
     CSS = """
     #body { height: 1fr; }
     ProjectTree { width: 1fr; border-right: heavy $primary; }
@@ -160,7 +167,21 @@ class Browser(App):
         if code:
             log.write(Text(f"(退出码 {code})", style="dim red"))
 
+    def action_quit(self) -> None:
+        """被聊天应用 push 时返回对话；独立运行时退出应用。"""
+        if len(self.app.screen_stack) > 1:
+            self.app.pop_screen()
+        else:
+            self.app.exit()
+
+
+class _BrowserApp(App):
+    """REPL 模式独立运行浏览器的壳。"""
+
+    def on_mount(self) -> None:
+        self.push_screen(BrowserScreen())
+
 
 def run_browser() -> None:
-    """运行双栏浏览器（阻塞直至用户按 q 退出，随后回到对话主循环）。"""
-    Browser().run()
+    """独立运行双栏浏览器（--repl 模式的 /browse；阻塞直至用户按 q 退出）。"""
+    _BrowserApp().run()
