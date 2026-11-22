@@ -56,9 +56,12 @@ class BrowserScreen(Screen):
         ("t", "toggle_term", "终端"),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, command_handler=None) -> None:
         super().__init__()
         self.cwd = str(PROJECT_DIR)  # 终端面板的当前目录（cd 持久化在这里）
+        # 斜杠命令回调（chatui 传入）：/ 开头的输入路由给对话层执行（/mode /model
+        # /file 等），浏览时不用退出就能切模式；None 时斜杠命令不可用（独立运行）
+        self.command_handler = command_handler
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="body"):
@@ -71,7 +74,7 @@ class BrowserScreen(Screen):
         with Vertical(id="term"):
             yield RichLog(id="termlog", markup=False, wrap=True)
             yield Input(
-                placeholder="终端命令（PowerShell；cd 支持相对/绝对路径）",
+                placeholder="终端命令（PowerShell）；/ 开头走对话命令（/mode /file …）",
                 id="termin",
             )
         yield Footer()
@@ -121,6 +124,20 @@ class BrowserScreen(Screen):
         if not cmd:
             return
         log = self.query_one("#termlog", RichLog)
+        if cmd.startswith("/"):
+            # 斜杠命令：路由给对话层（/mode /model /file /prompt /help …），
+            # 浏览时不用退出就能切换模式、管理附件
+            if self.command_handler is None:
+                log.write(Text("[独立运行时斜杠命令不可用；回对话后使用]", style="dim"))
+                return
+            log.write(Text(f"[对话命令] {cmd}", style="bold cyan"))
+            try:
+                out = self.command_handler(cmd)
+            except Exception as e:
+                out = f"[出错] {type(e).__name__}: {e}"
+            if out:
+                log.write(out)
+            return
         log.write(Text(f"PS> {cmd}", style="bold cyan"))
         if cmd == "cd" or cmd.startswith("cd ") or cmd.startswith("cd\t"):
             self._handle_cd(cmd[2:].strip(), log)

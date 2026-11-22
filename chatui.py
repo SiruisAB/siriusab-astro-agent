@@ -123,7 +123,9 @@ class ChatApp(App):
             style="dim",
         ), classes="thinking"))
         self.query_one("#prompt", Input).focus()
-        self.push_screen(BrowserScreen())  # 默认先打开文件浏览器；q/esc 返回对话
+        # 默认先打开文件浏览器；q/esc 返回对话。传入命令回调：
+        # 浏览器终端输入条里 / 开头的命令路由到这里执行（浏览时也能 /mode 切模式）
+        self.push_screen(BrowserScreen(command_handler=self._run_command_from_browser))
 
     # ---------- UI 基础 ----------
 
@@ -412,7 +414,7 @@ class ChatApp(App):
             self._append(Static(make_tree(".", depth), classes="assistant"))
             return
         if cmd == "/browse":
-            self.push_screen(BrowserScreen())
+            self.push_screen(BrowserScreen(command_handler=self._run_command_from_browser))
             return
         # 其余命令（/mode /model /prompt /help）走 handle_command，捕获其输出展示
         buf = io.StringIO()
@@ -422,6 +424,36 @@ class ChatApp(App):
         if out:
             self._append(Static(Text(out), classes="thinking"))
         self._update_title()
+
+    def _run_command_from_browser(self, text: str):
+        """浏览器终端输入条里的斜杠命令回调。
+
+        返回 str 或 rich 渲染对象，由浏览器写进终端日志区：
+        /view /tree 直接渲染成表格/树；/browse 提示已在浏览器；
+        其余走 handle_command（/mode 切模式、/model 切模型、/file 管附件…），
+        stdout 捕获为文本返回。命令对对话状态的实际效果（模式切换、附件管理）
+        与在对话流里输入完全一致。
+        """
+        cmd = text.split(None, 1)[0].lower()
+        if cmd == "/view":
+            args = text.split()
+            if len(args) < 2:
+                return "用法: /view <文件> [起始行|起始-结束]"
+            lines = parse_range(args[2]) if len(args) > 2 else None
+            if len(args) > 2 and lines is None:
+                return f"行号参数无效: {args[2]!r}  例: /view tools.py 100-150"
+            return view_renderable(args[1], lines)
+        if cmd == "/tree":
+            args = text.split()
+            depth = int(args[1]) if len(args) > 1 and args[1].isdigit() else 2
+            return make_tree(".", depth)
+        if cmd == "/browse":
+            return "已经在浏览器里了；q/esc 退出浏览器回到对话"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.mode = handle_command(text, self.mode, self.ctx["custom_prompts"], self.ctx)
+        self._update_title()
+        return buf.getvalue().rstrip() or "(无输出)"
 
 
 def run_chat(mode: str, ctx: dict) -> None:
