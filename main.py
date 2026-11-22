@@ -47,6 +47,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
+from chatstore import PLACEHOLDER_TITLE, ChatStore
 from tools import get_tools
 from viewer import list_tree, parse_range, view_file
 
@@ -1114,6 +1115,8 @@ HELP_TEXT = """
   /browse                           双栏文件浏览器（左目录树 / 右预览，q 退回对话）
                                     浏览器内按 t 呼出终端面板，可直接执行 PowerShell 命令
   /prompt <内容>                    为当前模式设置附加提示词（可有可无，叠加在默认提示词上）
+  /session                          chat 多会话：查看列表 / new [标题] / <编号> 切换
+                                    / rename <标题> / del <编号>（对话界面左侧也可点击切换）
   /file <路径> [更多…]              附加文件给模型（chat 模式：文本/源码/CSV/JSON/PDF/图片）
   /file                             查看已附加文件
   /file clear                       清除全部附件（移除单个: /file -1）
@@ -1407,6 +1410,86 @@ def chat_reply(
     return reply, thinking
 
 
+def session_command(text: str, ctx: dict) -> str:
+    """chat 多会话命令（/session）。REPL 直接打印返回值；chatui 展示进对话流
+    并刷新会话侧栏与消息区。
+
+    用法：/session（列表）| /session new [标题] | /session <编号> | /session
+    rename <标题> | /session del <编号>
+    操作 ctx["store"] / ctx["session_id"] / ctx["chat_history"]。
+    """
+    parts = text.split()
+    store: ChatStore = ctx["store"]
+    sub = parts[1].lower() if len(parts) > 1 else "list"
+
+    if sub == "new":
+        rest = text.split(None, 2)
+        title = rest[2].strip() if len(rest) > 2 else PLACEHOLDER_TITLE
+        ctx["session_id"] = store.create_session(title)
+        ctx["chat_history"].clear()
+        return f"已创建并切换到新会话：{store.get_title(ctx['session_id'])}"
+
+    if sub == "rename":
+        rest = text.split(None, 2)
+        if len(rest) < 3 or not rest[2].strip():
+            return "用法: /session rename <新标题>"
+        store.rename_session(ctx["session_id"], rest[2].strip())
+        return f"当前会话已重命名为：{rest[2].strip()}"
+
+    if sub == "del":
+        sessions = store.list_sessions()
+        if not parts[2:] or not parts[2].isdigit():
+            return "用法: /session del <编号>（/session 查看编号）"
+        idx = int(parts[2]) - 1
+        if not (0 <= idx < len(sessions)):
+            return f"编号超出范围（当前 {len(sessions)} 个会话）"
+        victim = sessions[idx]
+        store.delete_session(victim["id"])
+        if victim["id"] == ctx["session_id"]:  # 删的是当前会话 → 换到最近一个
+            rest = store.list_sessions()
+            if rest:
+                ctx["session_id"] = rest[0]["id"]
+                ctx["chat_history"].clear()
+                ctx["chat_history"].extend(store.load_messages(ctx["session_id"]))
+                return (f"已删除会话「{victim['title']}」，切换到最近会话"
+                        f"「{rest[0]['title']}」（{len(rest)-1} 个会话剩余）")
+            ctx["session_id"] = store.create_session()
+            ctx["chat_history"].clear()
+            return f"已删除最后一个会话，已创建新会话"
+        return f"已删除会话「{victim['title']}」"
+
+    if sub.isdigit():
+        sessions = store.list_sessions()
+        idx = int(sub) - 1
+        if not (0 <= idx < len(sessions)):
+            return f"编号超出范围（当前 {len(sessions)} 个会话）"
+        target = sessions[idx]
+        if target["id"] != ctx["session_id"]:
+            ctx["session_id"] = target["id"]
+            ctx["chat_history"].clear()
+            ctx["chat_history"].extend(store.load_messages(target["id"]))
+            return f"已切换到会话 {idx + 1}：「{target['title']}」（{len(ctx['chat_history'])} 条消息）"
+        return f"当前就在会话 {idx + 1}：「{target['title']}」"
+
+    if sub == "list":
+        sessions = store.list_sessions()
+        if not sessions:
+            return "还没有会话。新建: /session new [标题]"
+        lines = []
+        for i, s in enumerate(sessions, 1):
+            mark = "→" if s["id"] == ctx["session_id"] else " "
+            lines.append(f"{mark} {i}. {s['title']}  ({s['updated'][:16]})")
+        return ("会话列表：\n" + "\n".join(lines)
+                + "\n切换: /session <编号>   新建: /session new [标题]"
+                  "   重命名: /session rename <标题>   删除: /session del <编号>")
+
+    return ("用法: /session                查看会话列表\n"
+            "     /session new [标题]      新建并切换\n"
+            "     /session <编号>          切换到指定会话\n"
+            "     /session rename <标题>   重命名当前会话\n"
+            "     /session del <编号>      删除会话")
+
+
 def handle_command(text: str, mode: str, custom_prompts: dict, ctx: dict | None = None) -> str:
     """处理斜杠命令，返回（可能更新后的）模式。
 
@@ -1537,6 +1620,11 @@ def handle_command(text: str, mode: str, custom_prompts: dict, ctx: dict | None 
                 if mode != "chat":
                     print(f"提示：当前是 {mode} 模式，附件只在 chat 模式生效；"
                           f"{mode} 模式可用 read_file 工具直接读文件。")
+    elif cmd == "/session":
+        if ctx is None or "store" not in ctx:
+            print("/session 需要运行时上下文（chat 多会话）")
+        else:
+            print(session_command(text, ctx))
     elif cmd == "/view":
         rest = text.split(None, 1)
         if len(rest) < 2:
@@ -1595,12 +1683,24 @@ def main():
         if arg == "--prompt" and i + 1 < len(sys.argv):
             custom_prompts[mode] = sys.argv[i + 1]
 
+    # chat 多会话：启动时恢复最近使用的会话（消息存 sessions.db，重启不丢）
+    store = ChatStore(Path(__file__).resolve().parent / "sessions.db")
+    sessions = store.list_sessions()
+    if sessions:
+        session_id = sessions[0]["id"]
+        chat_history = store.load_messages(session_id)
+    else:
+        session_id = store.create_session()
+        chat_history = []
+
     ctx = {  # 共享运行时状态：REPL 与对话界面共用，handle_command 直接修改其中的字段
         "profiles": profiles,
         "current": start_profile,
         "model": model,
         "agents": agents,
-        "chat_history": [],  # chat 模式的独立历史
+        "store": store,  # chat 多会话存储
+        "session_id": session_id,
+        "chat_history": chat_history,
         "custom_prompts": custom_prompts,
         "attachments": [],  # chat 模式的待附加文件（/file 管理）
     }
@@ -1649,6 +1749,10 @@ def _repl(mode: str, ctx: dict) -> None:
                     profile_name=ctx.get("current"),
                 )
                 print(f"\n天文Agent: {reply}\n")
+                _store = ctx.get("store")
+                if _store:  # 多会话持久化 + 首问自动命名
+                    _store.replace_messages(ctx["session_id"], chat_history)
+                    _store.auto_title(ctx["session_id"], question)
                 if _artifact_auto_fetch(ctx.get("current")):
                     try:
                         note = artifact_note(fetch_artifacts(reply))

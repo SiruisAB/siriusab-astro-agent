@@ -21,8 +21,8 @@ from langgraph.types import Command
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
-from textual.containers import Vertical, VerticalScroll
-from textual.widgets import Collapsible, Footer, Header, Input, Markdown, Static
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.widgets import Collapsible, Footer, Header, Input, Label, ListItem, ListView, Markdown, Static
 
 from main import (
     MODE_CONFIGS,
@@ -33,6 +33,7 @@ from main import (
     chat_reply,
     fetch_artifacts,
     handle_command,
+    session_command,
 )
 from viewer import make_tree, parse_range, view_renderable
 from browser import BrowserScreen
@@ -77,6 +78,11 @@ def _agent_turn_extract(messages):
 
 class ChatApp(App):
     CSS = """
+    #main { height: 1fr; }
+    #side { width: 28; border-right: heavy $primary; display: none; }
+    #side.visible { display: block; }
+    .side-title { padding: 0 1; color: $primary; text-style: bold; }
+    #sessions { height: 1fr; }
     #chat { height: 1fr; padding: 0 1; }
     #bottom { dock: bottom; height: auto; }
     #status { height: 1; padding: 0 1; color: $warning; display: none; }
@@ -87,14 +93,19 @@ class ChatApp(App):
     .thinking { margin: 0; color: $text-muted; }
     """
 
-    BINDINGS = [("ctrl+q", "quit", "退出")]
+    BINDINGS = [
+        ("ctrl+q", "quit", "退出"),
+        ("s", "toggle_side", "会话栏"),
+    ]
 
     def __init__(self, mode: str, ctx: dict) -> None:
         super().__init__()
         self.mode = mode
-        self.ctx = ctx  # profiles/current/model/agents/chat_history/custom_prompts
+        self.ctx = ctx  # profiles/current/model/agents/store/session_id/chat_history/…
         self._busy = False
         self.awaiting_approval: dict | None = None  # {"queue": Queue} 挂起审批
+        self._current_question = ""                 # 当前轮提问（首问自动命名用）
+        self._session_ids: list[str] = []           # 侧栏序号 -> session_id
         # 流式状态（每轮开始时重置）
         self._live: Static | None = None        # 回答 Live 区（纯文本增量）
         self._live_text = ""
@@ -106,8 +117,12 @@ class ChatApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
-        with VerticalScroll(id="chat"):
-            yield Static("", id="welcome")
+        with Horizontal(id="main"):
+            with Vertical(id="side", classes="visible"):
+                yield Static("会话（n 新建 / 点击切换）", classes="side-title")
+                yield ListView(id="sessions")
+            with VerticalScroll(id="chat"):
+                yield Static("", id="welcome")
         with Vertical(id="bottom"):
             yield Static("", id="status")
             yield Input(placeholder="提问…（/help 查看命令；ctrl+q 退出）", id="prompt")
@@ -115,17 +130,71 @@ class ChatApp(App):
 
     def on_mount(self) -> None:
         self._update_title()
-        prof = self.ctx["profiles"].get(self.ctx["current"], {})
-        self._append(Static(Text(
-            "天文 Agent 对话模式。四档模式 /model 切模型 /view 看文件，"
-            f"/help 看全部。\n当前: {self.mode} 模式 — {MODE_CONFIGS[self.mode]['desc']}\n"
-            f"模型: {self.ctx['current']} ({prof.get('model', '?')})",
-            style="dim",
-        ), classes="thinking"))
+        self._refresh_sessions()
+        self._reload_chat_area()
         self.query_one("#prompt", Input).focus()
         # 默认先打开文件浏览器；q/esc 返回对话。传入命令回调：
         # 浏览器终端输入条里 / 开头的命令路由到这里执行（浏览时也能 /mode 切模式）
         self.push_screen(BrowserScreen(command_handler=self._run_command_from_browser))
+
+    # ---------- 会话侧栏与消息区 ----------
+
+    def _refresh_sessions(self) -> None:
+        """按 store 重建侧栏列表（最近更新在前，当前会话加 ▶）。"""
+        store = self.ctx["store"]
+        sessions = store.list_sessions()
+        self._session_ids = [s["id"] for s in sessions]
+        lv = self.query_one("#sessions", ListView)
+        lv.clear()
+        for i, s in enumerate(sessions, 1):
+            mark = "▶ " if s["id"] == self.ctx["session_id"] else ""
+            lv.append(ListItem(Label(f"{mark}{i}. {s['title']}", markup=False)))
+
+    def _reload_chat_area(self) -> None:
+        """整体重绘消息区：欢迎行 + 当前会话的全部历史（多模态历史只显示文本）。"""
+        chat = self.query_one("#chat", VerticalScroll)
+        chat.remove_children()
+        # 切换会话后流式组件全部作废
+        self._live = None
+        self._live_text = ""
+        self._draft_coll = None
+        self._draft_body = None
+        prof = self.ctx["profiles"].get(self.ctx["current"], {})
+        chat.mount(Static(Text(
+            "天文 Agent 对话模式。四档模式 /model 切模型 /view 看文件，"
+            f"/help 看全部；/session 管理会话。\n"
+            f"当前: {self.mode} 模式 — {MODE_CONFIGS[self.mode]['desc']}\n"
+            f"模型: {self.ctx['current']} ({prof.get('model', '?')})",
+            style="dim",
+        ), classes="thinking"))
+        for m in self.ctx["chat_history"]:
+            if isinstance(m, HumanMessage):
+                chat.mount(Static(Text(str(m.content)), classes="user"))
+            elif isinstance(m, AIMessage):
+                chat.mount(Markdown(str(m.content) or "（空回复）", classes="assistant"))
+        chat.scroll_end(animate=False)
+        self.query_one("#prompt", Input).focus()
+
+    @on(ListView.Selected, "#sessions")
+    def on_session_clicked(self, event: ListView.Selected) -> None:
+        idx = getattr(event, "index", None)
+        if idx is None:
+            idx = self.query_one("#sessions", ListView).index
+        if idx is None:
+            return
+        out = session_command(f"/session {idx + 1}", self.ctx)
+        self._append(Static(Text(out, style="dim"), classes="thinking"))
+        self._refresh_sessions()
+        self._reload_chat_area()
+
+    def action_toggle_side(self) -> None:
+        self.query_one("#side", Vertical).toggle_class("visible")
+
+    def action_new_session(self) -> None:
+        out = session_command("/session new", self.ctx)
+        self._append(Static(Text(out, style="dim"), classes="thinking"))
+        self._refresh_sessions()
+        self._reload_chat_area()
 
     # ---------- UI 基础 ----------
 
@@ -170,6 +239,7 @@ class ChatApp(App):
     def _ask(self, text: str) -> None:
         self._append(Static(Text(text), classes="user"))
         self._busy = True
+        self._current_question = text
         self._live = None
         self._live_text = ""
         self._delta_buf = ""
@@ -197,8 +267,13 @@ class ChatApp(App):
                     profile_name=self.ctx.get("current"),
                 )
                 self._flush_all()
+                # 多会话持久化：全量重写当前会话消息 + 首问自动命名 + 刷新侧栏
+                store = self.ctx["store"]
+                store.replace_messages(self.ctx["session_id"], self.ctx["chat_history"])
+                store.auto_title(self.ctx["session_id"], self._current_question)
                 note = self._fetch_artifacts(reply)
                 self.call_from_thread(self._show_reply, reply, thinking, note)
+                self.call_from_thread(self._refresh_sessions)
                 return
             mode = self.mode
             current_custom = self._custom(mode)
@@ -415,6 +490,13 @@ class ChatApp(App):
             return
         if cmd == "/browse":
             self.push_screen(BrowserScreen(command_handler=self._run_command_from_browser))
+            return
+        if cmd == "/session":
+            out = session_command(text, self.ctx)
+            if out:
+                self._append(Static(Text(out, style="dim"), classes="thinking"))
+            self._refresh_sessions()
+            self._reload_chat_area()
             return
         # 其余命令（/mode /model /prompt /help）走 handle_command，捕获其输出展示
         buf = io.StringIO()

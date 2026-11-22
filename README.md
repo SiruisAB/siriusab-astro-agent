@@ -303,7 +303,25 @@ PDF_NATIVE_GLM=1          :: 只对 glm 档案开启
 ## 交互命令
 
 `/mode <名>`、`/model <档案>`、`/view <文件> [起始-结束]`、`/file <路径>`（附加文件给模型）、
+`/unzip <zip路径>`（落盘解压到 results/unzipped/）、
+`/session`（chat 多会话）、
 `/tree [深度]`、`/browse`（双栏浏览器，按 t 呼出终端）、`/prompt <内容>`、`/help`、`ctrl+q` 退出。
+
+## chat 多会话（Cherry Studio / LM Studio 式）
+
+对话界面左侧有会话栏（按 `s` 收起/展开，点击条目切换）；每条会话独立存储在
+sessions.db，**重启程序历史不丢**，标题取首句提问（可用 `/session rename` 改）：
+
+```
+/session                会话列表（当前会话标 ▶）
+/session new [标题]     新建并切换（侧栏快捷键 n）
+/session <编号>         切换（点侧栏条目等价）
+/session rename <标题>  重命名当前会话
+/session del <编号>     删除（删当前会话会自动切到最近的）
+```
+
+切回旧会话时完整历史重新渲染（思考过程折叠块是实时的，不入库存档）。
+侧栏条目里 `/` 开头的编号即 `/session <编号>` 的编号，最近更新的会话排最前。
 
 ## 相对上游的修复（均已实测验证）
 
@@ -391,7 +409,8 @@ PDF_NATIVE_GLM=1          :: 只对 glm 档案开启
 astro-agent/
 ├── 启动.bat         启动脚本
 ├── main.py          四模式 + middleware 装配 + shell 审批 + 入口
-├── chatui.py        Textual 对话界面（流式、折叠块、审批内联）
+├── chatui.py        Textual 对话界面（流式、折叠块、审批内联、多会话侧栏）
+├── chatstore.py     chat 多会话存储（sessions.db 内两表，重启不丢）
 ├── tools.py         10 个工具 + 三层上下文管理
 ├── viewer.py        /view /tree 渲染
 ├── browser.py       双栏浏览器 + 终端面板
