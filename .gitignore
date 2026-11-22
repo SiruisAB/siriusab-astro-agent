@@ -1,0 +1,11 @@
+# 本地环境与依赖目录
+.conda/
+.venv/
+__pycache__/
+
+# 密钥配置（真实 API key，绝不入库）
+.env
+
+# 运行时产物
+results/
+sessions.db
