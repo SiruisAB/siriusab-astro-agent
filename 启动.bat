@@ -1,10 +1,13 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-if not exist ".conda\Scripts\python.exe" (
-    echo [错误] 未找到 .conda 环境，请先执行：
-    echo   E:\anaconda3\python.exe -m venv .conda  或  conda create -p .conda -y python=3.12
-    echo   .\.conda\Scripts\python.exe -m pip install -r requirements.txt
+rem 兼容两种环境布局：conda 环境的 python.exe 在 .conda 根目录，venv 的在 .conda\Scripts 下
+set "PY=.conda\python.exe"
+if not exist "%PY%" set "PY=.conda\Scripts\python.exe"
+if not exist "%PY%" (
+    echo [错误] 未找到 .conda 环境（.conda\python.exe 或 .conda\Scripts\python.exe），请先执行：
+    echo   conda create -p .conda -y python=3.12
+    echo   .\.conda\python.exe -m pip install -r requirements.txt
     pause
     exit /b 1
 )
@@ -15,5 +18,5 @@ if not exist ".env" (
     exit /b 1
 )
 echo 启动天文 Agent（对话界面，ctrl+q 退出）...
-".conda\Scripts\python.exe" main.py %*
+"%PY%" main.py %*
 pause

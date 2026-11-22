@@ -373,13 +373,13 @@ def _render_pdf_pages(path: Path) -> dict:
         return {"ok": False, "path": str(path), "note": f"PDF 渲染失败: {e}"}
 
 
-def _pdf_from_bytes(data: bytes, name: str) -> dict:
+def _pdf_from_bytes(data: bytes, name: str, profile_name: str | None = None) -> dict:
     """处理内存中的 PDF（压缩包内条目）。
 
     压缩包里嵌套 PDF 很常见，不能像二进制那样跳过。
     按 _pdf_mode() 决定提文本还是渲染页图；'file' 模式对包内条目无意义，退回文本。
     """
-    mode = _pdf_mode()
+    mode = _pdf_mode(profile_name)
     if mode == "image":
         try:
             import pypdfium2 as pdfium
@@ -530,7 +530,7 @@ def _ooxml_extract(data: bytes, name: str) -> dict:
     return {"ok": False, "note": f"{name} 不是可识别的 OOXML 文档"}
 
 
-def _read_archive(path: Path) -> dict:
+def _read_archive(path: Path, profile_name: str | None = None) -> dict:
     """解包压缩包，把里面的文本/图片整理成可注入的结构（纯内存，不落盘）。"""
     import io
     import zipfile
@@ -616,7 +616,7 @@ def _read_archive(path: Path) -> dict:
                                        f"{base64.b64encode(data).decode('ascii')}"})
             manifest_lines.append(f"  ✓ {name}（图片 {_fmt_bytes(size)}）")
         elif suffix in _ATTACH_PDF_SUFFIXES or data[:5] == b"%PDF-":
-            got = _pdf_from_bytes(data, name)
+            got = _pdf_from_bytes(data, name, profile_name)
             if not got["ok"]:
                 manifest_lines.append(f"  ✗ {got['note']}")
                 skipped += 1
@@ -670,10 +670,12 @@ def _read_archive(path: Path) -> dict:
             "note": f"{path.name}（压缩包，{total} 个条目，注入文本 {len(texts)} / 图片 {len(images)}）"}
 
 
-def _read_attachment(path_str: str) -> dict:
+def _read_attachment(path_str: str, profile_name: str | None = None) -> dict:
     """读一个附件。返回 dict：{ok, path, kind, text, data_url, note}。
 
     kind: "text" | "image" | "pdf"。失败时 ok=False，note 说明原因（不抛异常）。
+    profile_name：当前模型档案名——PDF_MODE_<档案> / SANDBOX_MODE_<档案> 这类
+    分档案开关要靠它生效；不传时走全局配置。
     """
     p = Path(path_str).expanduser()
     if not p.is_absolute():
@@ -685,7 +687,7 @@ def _read_attachment(path_str: str) -> dict:
     suffix = p.suffix.lower()
 
     # sandbox 模式：把非图片文件包成 polyglot，走图片通道投递
-    if _sandbox_mode() and _sniff_kind(p) != "image":
+    if _sandbox_mode(profile_name) and _sniff_kind(p) != "image":
         if size > _SANDBOX_MAX_BYTES:
             return {"ok": False, "path": str(p),
                     "note": f"文件过大（{_fmt_bytes(size)} > {_fmt_bytes(_SANDBOX_MAX_BYTES)}），"
@@ -730,7 +732,7 @@ def _read_attachment(path_str: str) -> dict:
         corrected = "image"
 
     if corrected == "archive":
-        got = _read_archive(p)
+        got = _read_archive(p, profile_name)
         if got.get("ok"):
             got["note"] = f"{got['note']}（按文件头识别：扩展名 {suffix or '无'} 与内容不符）"
         return got
@@ -741,7 +743,7 @@ def _read_attachment(path_str: str) -> dict:
 
 
     if _is_archive_name(p.name):
-        return _read_archive(p)
+        return _read_archive(p, profile_name)
 
     if suffix in _ATTACH_IMAGE_SUFFIXES:
         if size > _ATTACH_MAX_BYTES:
@@ -768,9 +770,9 @@ def _read_attachment(path_str: str) -> dict:
                 "note": f"{p.name}（图片，{_fmt_bytes(size)}）"}
 
     if suffix in _ATTACH_PDF_SUFFIXES:
-        if _pdf_mode() == "image":
+        if _pdf_mode(profile_name) == "image":
             return _render_pdf_pages(p)
-        if _pdf_mode() == "file":
+        if _pdf_mode(profile_name) == "file":
             # 原生 file 块：不提取文本，把 PDF 字节直接交给模型
             if size > _ATTACH_MAX_BYTES:
                 return {"ok": False, "path": str(p),
@@ -816,7 +818,8 @@ def _read_attachment(path_str: str) -> dict:
             "note": f"{p.name}（文本，{len(text)} 字符）"}
 
 
-def _compose_question(question: str, attachments: list[str], extra: str = ""):
+def _compose_question(question: str, attachments: list[str], extra: str = "",
+                      profile_name: str | None = None):
     """把问题与附件组装成消息 content。
 
     无图片时返回 str；有图片时返回 OpenAI 多模态 content block 列表。
@@ -828,7 +831,7 @@ def _compose_question(question: str, attachments: list[str], extra: str = ""):
     used = 0
 
     for path in attachments or []:
-        got = _read_attachment(path)
+        got = _read_attachment(path, profile_name)
         if not got["ok"]:
             notes.append(f"[附件未加载] {got['note']}")
             continue
@@ -1051,6 +1054,30 @@ def _history_note(question: str, attachments: list[str]) -> str:
     return f"{question}\n\n[本轮附加了文件：{names}]"
 
 
+def _split_attachments(attachments: list[str]) -> tuple[list[str], list[str]]:
+    """把附件分成 (文本类, 视觉/大体量类)。
+
+    chat 两阶段问答时：文本类两轮都发——终答必须能直接核对原文，不能只靠
+    草稿转述；图片/PDF/压缩包只在草稿轮发（多模态与大体量负载贵，重发会让
+    一次问答的视觉 token 翻倍），终答以草稿中的引用为准。
+    """
+    visual, texts = [], []
+    for a in attachments or []:
+        p = Path(a).expanduser()
+        if not p.is_absolute():
+            p = Path(__file__).resolve().parent / p
+        sniffed = _sniff_kind(p)
+        suffix = p.suffix.lower()
+        if (sniffed in ("image", "pdf", "archive")
+                or suffix in _ATTACH_IMAGE_SUFFIXES
+                or suffix in _ATTACH_PDF_SUFFIXES
+                or _is_archive_name(p.name)):
+            visual.append(a)
+        else:
+            texts.append(a)
+    return texts, visual
+
+
 # ========== 模式配置：提示词 + 工具子集 ==========
 
 MODE_CONFIGS = {
@@ -1169,7 +1196,9 @@ def _get_checkpointer() -> SqliteSaver:
     """持久记忆：会话存 sessions.db，重启后可恢复（懒初始化单例）。"""
     global _CHECKPOINTER
     if _CHECKPOINTER is None:
-        conn = sqlite3.connect("sessions.db", check_same_thread=False)
+        # 绝对路径：sessions.db 永远在项目目录，不跟随启动时的工作目录漂移
+        db_path = Path(__file__).resolve().parent / "sessions.db"
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
         _CHECKPOINTER = SqliteSaver(conn)
     return _CHECKPOINTER
 
@@ -1301,6 +1330,7 @@ def chat_reply(
     model: ChatOpenAI, chat_history: list, question: str, custom_prompt: str = "",
     attachments: list[str] | None = None,
     on_draft=None, on_answer=None,
+    profile_name: str | None = None,
 ):
     """学术问答模式：两阶段生成，两阶段均可自主调用文献/数据检索工具。
 
@@ -1308,8 +1338,11 @@ def chat_reply(
     custom_prompt 为可选附加提示词，草稿和终答阶段都会叠加。
     attachments 为待附加的文件路径列表（文本拼进提问、图片转多模态 block）；
     附件全文只出现在本轮的模型请求里，对话历史只留文件名，避免历史无限膨胀。
+    两阶段时附件分流：文本类两轮都发（终答要核对原文）；图片/PDF/压缩包只在
+    草稿轮发，终答阶段注明以草稿引用为准（避免视觉负载翻倍）。
     on_draft / on_answer：草稿、终答阶段的流式增量回调（对话界面传，
     逐段渲染；REPL 不传即无流式）。
+    profile_name：当前模型档案名，分档案开关（PDF_MODE_<档案> 等）靠它生效。
     环境变量 CHAT_TWO_STAGE=0 时切换为单阶段直答（1~2 次模型调用，更省）。
     返回 (回复文本, 思考过程 dict)：
     thinking = {"draft": 两阶段草稿或 None, "trace": 工具调用轨迹,
@@ -1317,8 +1350,10 @@ def chat_reply(
     """
     tools = get_tools("query")  # 查询类 + 文献类（arXiv/ADS），无 shell
     attach = [a for a in (attachments or []) if a]
+    text_attach, visual_attach = _split_attachments(attach)
     # 本轮真正发给模型的消息（含附件全文/图片），与写进历史的轻量版分开
-    human_now = HumanMessage(content=_compose_question(question, attach))
+    human_now = HumanMessage(content=_compose_question(question, attach,
+                                                        profile_name=profile_name))
     chat_history.append(HumanMessage(content=_history_note(question, attach)))
     trace: list = []
     thinking = {"draft": None, "trace": trace, "reasoning": ""}
@@ -1333,7 +1368,7 @@ def chat_reply(
             on_delta=on_answer,
         )
     else:
-        # 阶段一：内部草稿，自由推理试错，可查文献/天体数据
+        # 阶段一：内部草稿，自由推理试错，可查文献/天体数据（全部附件都在场）
         draft, _ = _chat_loop(
             model,
             compose_system(CHAT_DRAFT_PROMPT, custom_prompt),
@@ -1343,15 +1378,25 @@ def chat_reply(
             on_delta=on_draft,
         )
         thinking["draft"] = draft
-        # 阶段二：基于草稿输出结构化、标注置信度的最终回答
+        # 阶段二：基于草稿输出结构化、标注置信度的最终回答。
+        # 文本类附件重发（终答要直接核对原文）；图片/PDF/压缩包不重发，
+        # 注明以草稿引用为准——重发会让一次问答的视觉 token 翻倍。
+        stage2_extra = f"--- 内部思考草稿（供核查、修正、取舍）---\n{draft}"
+        if visual_attach:
+            names = "、".join(os.path.basename(v) for v in visual_attach)
+            stage2_extra += (
+                f"\n\n[说明] 附件 {names} 的完整内容已在上面的草稿阶段分析过，"
+                "本轮未重复发送；请以草稿中对它们的引用为准，不要声称能直接看到附件原文。"
+            )
         reply, thinking["reasoning"] = _chat_loop(
             model,
             compose_system(CHAT_PROMPT, custom_prompt),
             [
                 *chat_history[:-1],  # 此前的对话历史
                 HumanMessage(content=_compose_question(
-                    question, [],
-                    extra=f"--- 内部思考草稿（供核查、修正、取舍）---\n{draft}",
+                    question, text_attach,
+                    extra=stage2_extra,
+                    profile_name=profile_name,
                 )),
             ],
             tools,
@@ -1477,7 +1522,7 @@ def handle_command(text: str, mode: str, custom_prompts: dict, ctx: dict | None 
             added, failed = [], []
             for raw in sub.split():
                 path = raw.strip().strip('"').strip("'")
-                got = _read_attachment(path)
+                got = _read_attachment(path, ctx.get("current") if ctx else None)
                 if got["ok"]:
                     files.append(got["path"])
                     added.append(got["note"])
@@ -1601,6 +1646,7 @@ def _repl(mode: str, ctx: dict) -> None:
                 reply, _ = chat_reply(
                     ctx["model"], chat_history, question, custom_prompts.get("chat", ""),
                     attachments=ctx.get("attachments") or [],
+                    profile_name=ctx.get("current"),
                 )
                 print(f"\n天文Agent: {reply}\n")
                 if _artifact_auto_fetch(ctx.get("current")):

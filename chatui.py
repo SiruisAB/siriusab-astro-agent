@@ -192,6 +192,7 @@ class ChatApp(App):
                     attachments=self.ctx.get("attachments") or [],
                     on_draft=self._on_draft_delta,
                     on_answer=self._on_answer_delta,
+                    profile_name=self.ctx.get("current"),
                 )
                 self._flush_all()
                 note = self._fetch_artifacts(reply)
