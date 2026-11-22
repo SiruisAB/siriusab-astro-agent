@@ -34,6 +34,7 @@ from main import (
     fetch_artifacts,
     handle_command,
     session_command,
+    session_model,
 )
 from viewer import make_tree, parse_range, view_renderable
 from browser import BrowserScreen
@@ -259,7 +260,7 @@ class ChatApp(App):
         try:
             if self.mode == "chat":
                 reply, thinking = chat_reply(
-                    self.ctx["model"], self.ctx["chat_history"], question,
+                    session_model(self.ctx), self.ctx["chat_history"], question,
                     custom_prompt=self._custom("chat"),
                     attachments=self.ctx.get("attachments") or [],
                     on_draft=self._on_draft_delta,

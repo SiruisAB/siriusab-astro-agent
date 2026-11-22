@@ -10,6 +10,7 @@
 并发时的锁冲突概率；所有连接用 closing() 显式关闭，不留文件锁。
 """
 
+import json
 import sqlite3
 import uuid
 from contextlib import closing
@@ -46,6 +47,13 @@ class ChatStore:
         self._path = str(db_path)
         with closing(self._conn()) as db:
             db.executescript(_SCHEMA)
+            # 老库迁移：补 params 列（会话级采样参数，JSON 字符串）
+            cols = {r[1] for r in db.execute("PRAGMA table_info(chat_sessions)").fetchall()}
+            if "params" not in cols:
+                db.execute(
+                    "ALTER TABLE chat_sessions ADD COLUMN params TEXT NOT NULL DEFAULT '{}'"
+                )
+                db.commit()
 
     def _conn(self) -> sqlite3.Connection:
         db = sqlite3.connect(self._path, timeout=10, check_same_thread=False)
@@ -100,6 +108,22 @@ class ChatStore:
             db.execute(
                 "UPDATE chat_sessions SET updated = ? WHERE session_id = ?",
                 (_now(), sid),
+            )
+
+    # ---------- 会话级参数 ----------
+
+    def get_params(self, sid: str) -> dict:
+        with closing(self._conn()) as db:
+            row = db.execute(
+                "SELECT params FROM chat_sessions WHERE session_id = ?", (sid,)
+            ).fetchone()
+        return json.loads(row[0]) if row and row[0] else {}
+
+    def set_params(self, sid: str, params: dict) -> None:
+        with closing(self._conn()) as db, db:
+            db.execute(
+                "UPDATE chat_sessions SET params = ?, updated = ? WHERE session_id = ?",
+                (json.dumps(params, ensure_ascii=False), _now(), sid),
             )
 
     def auto_title(self, sid: str, first_question: str) -> None:

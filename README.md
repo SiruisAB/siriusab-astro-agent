@@ -34,6 +34,31 @@ E:\anaconda3\python.exe -m venv .conda
 
 运行中 `/model <档案名>` 热切换（档案用 `MODEL_NAME_<名字>` 定义）。
 
+### 浏览器版（textual-serve）
+
+把对话界面投到浏览器（Cherry Studio 的"壳"：窗口、鼠标点侧栏切会话）：
+
+```bat
+.\.conda\python.exe serve.py              :: http://localhost:8000
+.\.conda\python.exe serve.py --port 8080 --mode research
+```
+
+每个浏览器标签是独立的界面进程，会话数据共享 sessions.db；流式渲染、
+思考折叠块、shell 审批、/file 附件在浏览器里行为与终端一致。
+
+### 会话级采样参数（/param）
+
+```bat
+/param                          :: 查看当前会话参数
+/param temp 0.7                 :: temperature 0~2
+/param top_p 0.9                :: 0~1
+/param max_tokens 4096          :: 输出上限
+/param reset                    :: 重置（恢复全局 temperature=0）
+```
+
+只对 chat 模式生效，随会话保存；agent/research/code 是工具循环，
+保持 temperature=0 以保证数据与代码的确定性。
+
 ## 四种模式
 
 | 模式 | 工具子集 | 适用 |

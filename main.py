@@ -1115,6 +1115,8 @@ HELP_TEXT = """
   /browse                           双栏文件浏览器（左目录树 / 右预览，q 退回对话）
                                     浏览器内按 t 呼出终端面板，可直接执行 PowerShell 命令
   /prompt <内容>                    为当前模式设置附加提示词（可有可无，叠加在默认提示词上）
+  /param [参数] [数值]              chat 会话级采样参数：temp / top_p / max_tokens
+                                    /param 查看 | /param reset 重置
   /session                          chat 多会话：查看列表 / new [标题] / <编号> 切换
                                     / rename <标题> / del <编号>（对话界面左侧也可点击切换）
   /file <路径> [更多…]              附加文件给模型（chat 模式：文本/源码/CSV/JSON/PDF/图片）
@@ -1410,6 +1412,76 @@ def chat_reply(
     return reply, thinking
 
 
+# 会话级采样参数：/param 的别名 → ChatOpenAI 实参名，及取值范围
+_PARAM_ALIASES = {"temp": "temperature", "temperature": "temperature",
+                  "top_p": "top_p", "max_tokens": "max_tokens"}
+_PARAM_LIMITS = {"temperature": (0.0, 2.0), "top_p": (0.0, 1.0),
+                 "max_tokens": (64, 200000)}
+
+
+def param_command(text: str, ctx: dict) -> str:
+    """会话级采样参数（/param）：仅 chat 模式的模型生效，落到当前会话元数据。
+
+    用法：/param（查看）| /param temp <0~2> | /param top_p <0~1> |
+    /param max_tokens <数值> | /param reset
+    """
+    parts = text.split()
+    store: ChatStore = ctx["store"]
+    sid = ctx["session_id"]
+    if len(parts) == 1 or parts[1].lower() in ("list", "show"):
+        params = store.get_params(sid)
+        if not params:
+            return ("当前会话参数：未设置（跟随全局 temperature=0）\n"
+                    "设置: /param temp <0~2> | /param top_p <0~1> | /param max_tokens <数值>\n"
+                    "重置: /param reset")
+        lines = [f"  {k} = {v}" for k, v in sorted(params.items())]
+        return "当前会话参数：\n" + "\n".join(lines) + "\n重置: /param reset"
+    if parts[1].lower() == "reset":
+        store.set_params(sid, {})
+        return "已重置会话参数（恢复全局 temperature=0）"
+    key = _PARAM_ALIASES.get(parts[1].lower())
+    if key is None:
+        return f"未知参数 {parts[1]!r}。可用: temp / top_p / max_tokens（/param 查看）"
+    if len(parts) < 3:
+        return f"用法: /param {parts[1]} <数值>"
+    try:
+        value = float(parts[2])
+    except ValueError:
+        return f"数值无效: {parts[2]!r}"
+    if key == "max_tokens":
+        value = int(value)
+    lo, hi = _PARAM_LIMITS[key]
+    if not (lo <= value <= hi):
+        return f"{key} 超出范围 [{lo}, {hi}]"
+    params = store.get_params(sid)
+    params[key] = value
+    store.set_params(sid, params)
+    return f"已设置本会话 {key} = {value}（仅 chat 模式，即时生效）"
+
+
+def session_model(ctx: dict):
+    """chat 模式当前会话用的模型实例。
+
+    未设置会话级参数时直接复用全局模型（零开销）；设置了则按 (档案, 参数)
+    现建 ChatOpenAI 并缓存在 ctx["session_models"]，改参数后缓存键变化自动重建。
+    """
+    store = ctx.get("store")
+    params = store.get_params(ctx["session_id"]) if store else {}
+    if not params:
+        return ctx["model"]
+    key = (ctx.get("current"), tuple(sorted(params.items())))
+    cache = ctx.setdefault("session_models", {})
+    if key not in cache:
+        profile = ctx["profiles"].get(ctx.get("current"), {})
+        cache[key] = ChatOpenAI(
+            model=profile.get("model", "gpt-4o-mini"),
+            api_key=profile.get("api_key"),
+            base_url=profile.get("base_url") or None,
+            **params,
+        )
+    return cache[key]
+
+
 def session_command(text: str, ctx: dict) -> str:
     """chat 多会话命令（/session）。REPL 直接打印返回值；chatui 展示进对话流
     并刷新会话侧栏与消息区。
@@ -1625,6 +1697,11 @@ def handle_command(text: str, mode: str, custom_prompts: dict, ctx: dict | None 
             print("/session 需要运行时上下文（chat 多会话）")
         else:
             print(session_command(text, ctx))
+    elif cmd == "/param":
+        if ctx is None or "store" not in ctx:
+            print("/param 需要运行时上下文（chat 会话级参数）")
+        else:
+            print(param_command(text, ctx))
     elif cmd == "/view":
         rest = text.split(None, 1)
         if len(rest) < 2:
@@ -1744,7 +1821,7 @@ def _repl(mode: str, ctx: dict) -> None:
         try:
             if mode == "chat":
                 reply, _ = chat_reply(
-                    ctx["model"], chat_history, question, custom_prompts.get("chat", ""),
+                    session_model(ctx), chat_history, question, custom_prompts.get("chat", ""),
                     attachments=ctx.get("attachments") or [],
                     profile_name=ctx.get("current"),
                 )

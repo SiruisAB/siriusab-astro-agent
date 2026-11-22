@@ -7,6 +7,10 @@ deepagents>=0.7
 python-dotenv
 rich>=13
 textual>=1.0
+
+# 可选：serve.py 把对话界面投到浏览器时需要
+textual-serve>=0.7
+
 astropy
 astroquery
 requests>=2.28
