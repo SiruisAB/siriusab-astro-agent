@@ -58,7 +58,8 @@ cp .env.example .env             # 然后编辑 .env，填入你的 API key
 每个模式是独立 agent 实例（提示词/工具/记忆各自独立）。交互命令：
 `/mode research`、`/mode chat`、`/mode`（查看全部）、`/model glm`（切换模型）、
 `/model`（查看模型档案）、`/view tools.py 10-50`（查看文件：代码高亮/md 渲染/csv 表格）、
-`/tree`（目录树）、`/browse`（双栏浏览器：左目录树右预览，q 退回对话）、`/help`；
+`/tree`（目录树）、`/browse`（双栏浏览器：左目录树右预览，t 呼出终端面板直接跑命令，
+q 退回对话）、`/help`；
 启动指定模式：`./.conda/python.exe main.py --mode research`（`--chat` 为简写），
 启动指定模型：`--model glm`。
 
