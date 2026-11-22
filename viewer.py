@@ -1,7 +1,9 @@
 """终端文件查看：rich 渲染 md / 代码 / csv / json，树形列目录。
 
-供 main.py 的 /view、/tree 命令使用。纯展示层（人看），不进模型上下文——
-agent 自己读文件走 FilesystemMiddleware 的文件工具。
+两层使用方：
+- main.py 的 /view、/tree 命令（纯展示层，人看，不进模型上下文——
+  agent 自己读文件走 FilesystemMiddleware 的文件工具）
+- browser.py 的双栏预览（复用 to_renderable，保证两处渲染一致）
 """
 
 import csv
@@ -42,6 +44,53 @@ def parse_range(arg: str) -> tuple[int, int]:
     return max(n, 1), n + 39
 
 
+def _csv_rows(text: str) -> list[list[str]]:
+    return list(csv.reader(text.splitlines()))
+
+
+def _csv_table(rows: list[list[str]], name: str,
+               row_range: tuple[int, int] | None = None,
+               max_rows: int | None = MAX_CSV_ROWS) -> Table | None:
+    """csv 行 → rich 表格。row_range 按原始行切片；否则默认前 max_rows 行数据。空文件返回 None。"""
+    if not rows:
+        return None
+    ncols = len(rows[0])
+    if row_range:
+        shown = rows[row_range[0] - 1 : row_range[1]]
+    elif max_rows is None:
+        shown = rows[1:]
+    else:
+        shown = rows[1 : max_rows + 1]
+    table = Table(show_header=True, header_style="bold",
+                  title=f"{name}（共 {len(rows) - 1} 行数据）")
+    for col in rows[0]:
+        table.add_column(str(col) or "")
+    for r in shown:
+        table.add_row(*((list(r) + [""] * ncols)[:ncols]))  # 补齐/截断到表头列数
+    return table
+
+
+def to_renderable(path: Path, text: str, start_line: int = 1):
+    """按扩展名把文件文本转成 rich 渲染对象——/view 与 /browse 双栏预览共用。
+
+    start_line 仅对带行号的代码视图生效（切片后行号连续）。
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return _csv_table(_csv_rows(text), path.name)
+    if suffix == ".json":
+        return JSON(text)
+    if suffix == ".md":
+        return Markdown(text)
+    if suffix in TEXT_SUFFIXES or not suffix:
+        return text
+    try:  # 代码文件：语法高亮 + 行号
+        return Syntax(text, suffix.lstrip(".") or "text", line_numbers=True,
+                      start_line=start_line, theme="ansi_dark", word_wrap=True)
+    except Exception:  # 未知扩展名 pygments 不认识时退回纯文本
+        return Syntax(text, "text", line_numbers=True, start_line=start_line, word_wrap=True)
+
+
 def view_file(path: str, lines: tuple[int, int] | None = None) -> None:
     """按扩展名选择渲染方式查看文件。lines 为 (起始行, 结束行)，可选。"""
     p = _resolve(path)
@@ -57,50 +106,25 @@ def view_file(path: str, lines: tuple[int, int] | None = None) -> None:
 
     suffix = p.suffix.lower()
     if suffix == ".csv":
-        _view_csv(p, text, lines)
-        return
-    if suffix == ".json":
-        console.print(JSON(text))
+        rows = _csv_rows(text)
+        table = _csv_table(rows, p.name, row_range=lines)
+        if table is None:
+            console.print("[dim]（空文件）[/dim]")
+            return
+        console.print(table)
+        if not lines and len(rows) - 1 > MAX_CSV_ROWS:
+            console.print(f"[dim]… 仅显示前 {MAX_CSV_ROWS} 行；全部查看: /view {p.name} 1-{len(rows)}[/dim]")
         return
 
-    start = lines[0] if lines else None
+    start = lines[0] if lines else 1
     if lines:
-        all_lines = text.splitlines()
-        text = "\n".join(all_lines[start - 1 : lines[1]])
+        text = "\n".join(text.splitlines()[start - 1 : lines[1]])
 
-    if suffix == ".md":
-        console.print(Markdown(text))
-    elif suffix in TEXT_SUFFIXES or not suffix:
-        console.print(f"[dim]{p}[/dim]\n{text}")
-    else:  # 代码文件：语法高亮 + 行号（start_line 保证切片后行号连续）
-        try:
-            console.print(
-                Syntax(text, suffix.lstrip(".") or "text", line_numbers=True,
-                       start_line=start or 1, theme="ansi_dark", word_wrap=True)
-            )
-        except Exception:  # 未知扩展名 pygments 不认识时退回纯文本
-            console.print(Syntax(text, "text", line_numbers=True,
-                                 start_line=start or 1, word_wrap=True))
-
-
-def _view_csv(p: Path, text: str, lines: tuple[int, int] | None) -> None:
-    """csv → rich 表格。不带行号参数时只显示前 MAX_CSV_ROWS 行，避免刷屏。"""
-    rows = list(csv.reader(text.splitlines()))
-    if not rows:
-        console.print("[dim]（空文件）[/dim]")
-        return
-    shown = rows[lines[0] - 1 : lines[1]] if lines else rows[1 : MAX_CSV_ROWS + 2]
-    ncols = len(rows[0])
-    table = Table(show_header=True, header_style="bold",
-                  title=f"{p.name}（共 {len(rows) - 1} 行数据）")
-    for col in rows[0]:
-        table.add_column(str(col) or "")
-    for r in shown:
-        r = (list(r) + [""] * ncols)[:ncols]  # 补齐/截断到表头列数
-        table.add_row(*r)
-    console.print(table)
-    if not lines and len(rows) - 1 > MAX_CSV_ROWS:
-        console.print(f"[dim]… 仅显示前 {MAX_CSV_ROWS} 行；全部查看: /view {p.name} 1-{len(rows)}[/dim]")
+    renderable = to_renderable(p, text, start_line=start)
+    if suffix in TEXT_SUFFIXES or not suffix:
+        console.print(f"[dim]{p}[/dim]\n{renderable}")
+    else:
+        console.print(renderable)
 
 
 def list_tree(root: str = ".", depth: int = 2) -> None:

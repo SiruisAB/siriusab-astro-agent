@@ -155,6 +155,7 @@ HELP_TEXT = """
   /model                            查看已配置的模型档案与当前模型
   /view <文件> [起始|起始-结束]     查看文件：md 渲染 / 代码高亮+行号 / csv 表格 / json
   /tree [深度]                      树形查看项目目录（默认 2 层）
+  /browse                           双栏文件浏览器（左目录树 / 右预览，q 退回对话）
   /prompt <内容>                    为当前模式设置附加提示词（可有可无，叠加在默认提示词上）
   /prompt off                       清除当前模式的附加提示词
   /prompt                           查看当前模式的附加提示词
@@ -444,10 +445,17 @@ def handle_command(text: str, mode: str, custom_prompts: dict, ctx: dict | None 
     elif cmd == "/tree":
         depth = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 2
         list_tree(".", depth)
+    elif cmd == "/browse":
+        try:
+            from browser import run_browser  # 懒导入：未装 textual 不影响主程序启动
+
+            run_browser()
+        except Exception as e:
+            print(f"[浏览器无法启动] {e}\n[dim]提示: ./.conda/python.exe -m pip install textual[/dim]")
     elif cmd == "/help":
         print(HELP_TEXT)
     else:
-        print("未知命令。可用: /mode [模式名]、/model [档案名]、/view [文件]、/tree、/prompt [内容]、/help")
+        print("未知命令。可用: /mode [模式名]、/model [档案名]、/view [文件]、/tree、/browse、/prompt [内容]、/help")
     return mode
 
 
