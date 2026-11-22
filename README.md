@@ -58,10 +58,12 @@ cp .env.example .env             # 然后编辑 .env，填入你的 API key
 
 每个模式是独立 agent 实例（提示词/工具/记忆各自独立）。
 
-**对话式界面（默认）**：消息按对话流排列，回答为 Markdown 渲染；思考过程默认收纳在
-可展开的折叠块里——推理模型的 `reasoning_content`、chat 模式的两阶段内部草稿、
-agent 的工具调用轨迹各成一块，点击展开。命令直接输入，`/browse` 以全屏打开
-（escape 返回），shell 审批在对话内完成（y/n/替代命令），`ctrl+q` 退出。
+**对话式界面（默认）**：启动先打开文件浏览器（q/esc 返回对话）。消息按对话流排列；
+**回答流式输出**——Live 区逐段增量渲染，完成后替换为 Markdown 正式排版；chat 两阶段时
+草稿在展开的折叠块里流式生成，答完自动收起。思考过程默认收纳在可展开的折叠块里——
+推理模型的 `reasoning_content`、chat 模式的两阶段内部草稿、agent 的工具调用轨迹各成一块，
+点击展开。命令直接输入，`/browse` 以全屏打开（escape 返回），shell 审批在对话内完成
+（y/n/替代命令），`ctrl+q` 退出。
 
 交互命令：
 `/mode research`、`/mode chat`、`/mode`（查看全部）、`/model glm`（切换模型）、

@@ -290,31 +290,62 @@ def _msg_reasoning(resp) -> str:
     return r.strip() if isinstance(r, str) and r.strip() else ""
 
 
+def _stream_round(model_bt, convo, on_delta=None):
+    """跑一轮对话（bind_tools 后的模型）。
+
+    on_delta 传入时用 stream 模式：文本增量逐段回调（reasoning_content 静默累积，
+    不回调）；否则用 invoke。返回 (content, reasoning 原始累积, tool_calls, 本轮完整消息)。
+    """
+    if on_delta is None:
+        resp = model_bt.invoke(convo)
+        kw = getattr(resp, "additional_kwargs", {}) or {}
+        return resp.content, (kw.get("reasoning_content") or ""), (resp.tool_calls or []), resp
+    final = None
+    reasoning = ""
+    for chunk in model_bt.stream(convo):
+        final = chunk if final is None else final + chunk  # AIMessageChunk 可累加
+        kw = getattr(chunk, "additional_kwargs", {}) or {}
+        reasoning += kw.get("reasoning_content") or ""
+        delta = chunk.content
+        if isinstance(delta, str) and delta:
+            on_delta(delta)
+    if final is None:
+        return "", "", [], None
+    return final.content, reasoning, (final.tool_calls or []), final
+
+
 def _chat_loop(
-    model: ChatOpenAI, system_content: str, messages: list, tools: list, trace: list | None = None
+    model: ChatOpenAI, system_content: str, messages: list, tools: list,
+    trace: list | None = None, on_delta=None,
 ):
     """chat 模式的内部对话循环：模型可自主调用文献/数据检索工具。
 
     与 agent 模式的区别：只挂查询+文献类工具（无 shell），轮数有上限，
     整个循环的中间过程（工具调用与结果）不进入对话历史。
     trace 传入列表时记录每次工具调用（对话界面展示思考过程用）。
-    返回 (回复文本, reasoning_content 或 "")。
+    on_delta 传入时流式回调每轮文本增量（对话界面逐段渲染用）。
+    返回 (回复文本, reasoning_content 或 "")；回复为各轮文本的拼接
+    （通常只有最后一轮有文本，中间轮的简短说明也会保留）。
     """
     if not tools:
-        resp = model.invoke([SystemMessage(content=system_content), *messages])
-        return resp.content, _msg_reasoning(resp)
+        content, reasoning, _, _ = _stream_round(
+            model, [SystemMessage(content=system_content), *messages], on_delta)
+        return content, reasoning.strip()
+
     model_bt = model.bind_tools(tools)
     by_name = {t.name: t for t in tools}
     convo = [SystemMessage(content=system_content), *messages]
-    resp = None
     reasoning = ""
+    texts: list = []
     for _ in range(CHAT_MAX_TOOL_ROUNDS):
-        resp = model_bt.invoke(convo)
-        reasoning = _msg_reasoning(resp) or reasoning
-        if not getattr(resp, "tool_calls", None):
-            return resp.content, reasoning
-        convo.append(resp)
-        for tc in resp.tool_calls:
+        content, round_reasoning, tool_calls, msg = _stream_round(model_bt, convo, on_delta)
+        reasoning = reasoning or round_reasoning.strip()
+        if isinstance(content, str) and content:
+            texts.append(content)
+        if not tool_calls:
+            return "\n\n".join(texts), reasoning
+        convo.append(msg)
+        for tc in tool_calls:
             tool = by_name.get(tc["name"])
             result = tool.invoke(tc["args"]) if tool else f"未知工具: {tc['name']}"
             convo.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
@@ -324,16 +355,19 @@ def _chat_loop(
                     "args": {k: str(v)[:80] for k, v in (tc["args"] or {}).items()},
                     "result": str(result)[:150],
                 })
-    return (resp.content if resp else ""), reasoning  # 轮数上限兜底
+    return "\n\n".join(texts), reasoning  # 轮数上限兜底
 
 
 def chat_reply(
-    model: ChatOpenAI, chat_history: list, question: str, custom_prompt: str = ""
+    model: ChatOpenAI, chat_history: list, question: str, custom_prompt: str = "",
+    on_draft=None, on_answer=None,
 ):
     """学术问答模式：两阶段生成，两阶段均可自主调用文献/数据检索工具。
 
     对用户而言仍是一次性输出；草稿与工具调用的中间过程不进入对话历史。
     custom_prompt 为可选附加提示词，草稿和终答阶段都会叠加。
+    on_draft / on_answer：草稿、终答阶段的流式增量回调（对话界面传，
+    逐段渲染；REPL 不传即无流式）。
     环境变量 CHAT_TWO_STAGE=0 时切换为单阶段直答（1~2 次模型调用，更省）。
     返回 (回复文本, 思考过程 dict)：
     thinking = {"draft": 两阶段草稿或 None, "trace": 工具调用轨迹,
@@ -351,6 +385,7 @@ def chat_reply(
             list(chat_history),  # 全部历史 + 本次提问
             tools,
             trace=trace,
+            on_delta=on_answer,
         )
     else:
         # 阶段一：内部草稿，自由推理试错，可查文献/天体数据
@@ -360,6 +395,7 @@ def chat_reply(
             [HumanMessage(content=question)],
             tools,
             trace=trace,
+            on_delta=on_draft,
         )
         thinking["draft"] = draft
         # 阶段二：基于草稿输出结构化、标注置信度的最终回答
@@ -374,6 +410,7 @@ def chat_reply(
             ],
             tools,
             trace=trace,
+            on_delta=on_answer,
         )
     chat_history.append(AIMessage(content=reply))
     return reply, thinking

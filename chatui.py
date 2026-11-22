@@ -1,20 +1,22 @@
-"""对话式主界面（LM Studio 风格，Textual TUI）。
+"""对话式主界面（LM Studio 风格，Textual TUI，流式输出）。
 
-- 消息流：用户消息与助手 Markdown 回答按时间排列，整体滚动
-- 思考过程收纳：推理模型的 reasoning_content、chat 两阶段草稿、
-  agent 的工具调用轨迹 → Collapsible 折叠块（默认收起，点击/回车展开）
-- 后台线程 worker 调 agent / chat_reply，界面不冻结；shell 审批在对话内完成
-  （y=批准 / n=拒绝 / 输入替代命令）
-- 斜杠命令与 REPL 相同：/mode /model /prompt /help 走 handle_command；
-  /view /tree 直接渲染进对话流；/browse 以全屏 Screen 打开（escape 返回）
-- ctrl+q 退出；main.py 以 --repl 启动旧式逐行交互
+- 启动默认先打开文件浏览器（BrowserScreen），q/esc 返回对话
+- 消息流：用户消息与助手回答按时间排列，整体滚动
+- 流式输出：回答逐段渲染进 Live 区（纯文本增量，成本低），完成后替换为
+  Markdown 正式渲染；chat 两阶段时草稿在展开的折叠块里流式生成，
+  答完自动收起
+- 思考过程收纳：推理模型 reasoning_content、chat 两阶段草稿、
+  agent 工具调用轨迹 → Collapsible 折叠块
+- 后台线程 worker；shell 审批在对话内完成（y/n/替代命令）
+- 斜杠命令与 REPL 相同；/browse 全屏进出；ctrl+q 退出
 """
 
 import contextlib
 import io
+import os
 import queue
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.types import Command
 from rich.text import Text
 from textual import on, work
@@ -31,6 +33,8 @@ from main import (
 )
 from viewer import make_tree, parse_range, view_renderable
 from browser import BrowserScreen
+
+FLUSH_CHARS = 24  # 流式增量缓冲阈值：攒够再跨线程刷新，避免逐 token 重绘
 
 
 def _agent_turn_extract(messages):
@@ -88,6 +92,14 @@ class ChatApp(App):
         self.ctx = ctx  # profiles/current/model/agents/chat_history/custom_prompts
         self._busy = False
         self.awaiting_approval: dict | None = None  # {"queue": Queue} 挂起审批
+        # 流式状态（每轮开始时重置）
+        self._live: Static | None = None        # 回答 Live 区（纯文本增量）
+        self._live_text = ""
+        self._delta_buf = ""                    # worker 线程侧缓冲
+        self._draft_coll: Collapsible | None = None
+        self._draft_body: Static | None = None
+        self._draft_text = ""
+        self._draft_buf = ""
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -108,12 +120,13 @@ class ChatApp(App):
             style="dim",
         ), classes="thinking"))
         self.query_one("#prompt", Input).focus()
+        self.push_screen(BrowserScreen())  # 默认先打开文件浏览器；q/esc 返回对话
 
     # ---------- UI 基础 ----------
 
-    def _append(self, widget) -> None:
+    def _append(self, widget, before=None) -> None:
         chat = self.query_one("#chat", VerticalScroll)
-        chat.mount(widget)
+        chat.mount(widget, before=before)
         chat.scroll_end(animate=False)
 
     def _status(self, text: str) -> None:
@@ -152,10 +165,19 @@ class ChatApp(App):
     def _ask(self, text: str) -> None:
         self._append(Static(Text(text), classes="user"))
         self._busy = True
-        self._status("思考中…（ctrl+q 退出）")
+        self._live = None
+        self._live_text = ""
+        self._delta_buf = ""
+        self._draft_coll = None
+        self._draft_body = None
+        self._draft_text = ""
+        self._draft_buf = ""
+        two_stage = os.environ.get("CHAT_TWO_STAGE", "1").lower() not in ("0", "false", "no", "off")
+        self._status("内部草稿生成中…" if (two_stage and self.mode == "chat")
+                     else "思考中…（ctrl+q 退出）")
         self._run_turn(text)
 
-    # ---------- 后台执行 ----------
+    # ---------- 后台执行（线程 worker）----------
 
     @work(thread=True)
     def _run_turn(self, question: str) -> None:
@@ -164,7 +186,10 @@ class ChatApp(App):
                 reply, thinking = chat_reply(
                     self.ctx["model"], self.ctx["chat_history"], question,
                     custom_prompt=self._custom("chat"),
+                    on_draft=self._on_draft_delta,
+                    on_answer=self._on_answer_delta,
                 )
+                self._flush_all()
                 self.call_from_thread(self._show_reply, reply, thinking)
                 return
             mode = self.mode
@@ -179,24 +204,86 @@ class ChatApp(App):
                 agents[mode] = {"agent": agent, "config": config,
                                 "custom": current_custom, "model": self.ctx["current"]}
             rec = agents[mode]
-            result = rec["agent"].invoke(
-                {"messages": [{"role": "user", "content": question}]},
-                config=rec["config"],
-            )
-            while "__interrupt__" in result:  # shell 审批：界面内完成
-                req = result["__interrupt__"][0].value
+            inputs = {"messages": [{"role": "user", "content": question}]}
+            while True:
+                pending = None
+                for kind, data in rec["agent"].stream(
+                    inputs, config=rec["config"], stream_mode=["messages", "updates"],
+                ):
+                    if kind == "messages":
+                        chunk, _meta = data
+                        if isinstance(chunk, AIMessageChunk):
+                            delta = chunk.content
+                            if isinstance(delta, str) and delta:
+                                self._on_answer_delta(delta)
+                    elif kind == "updates" and "__interrupt__" in data:
+                        pending = data["__interrupt__"]
+                self._flush_answer()
+                if not pending:
+                    break
+                req = pending[0].value
                 q: "queue.Queue" = queue.Queue()
                 self.call_from_thread(self._ask_approval, req, q)
-                decision = q.get()  # worker 阻塞等待，界面照常可用
-                result = rec["agent"].invoke(Command(resume=[decision]), config=rec["config"])
-            answer, thinking = _agent_turn_extract(result["messages"])
+                decision = q.get()  # worker 阻塞等待审批，界面照常可用
+                inputs = Command(resume=[decision])
+            state = rec["agent"].get_state(rec["config"])
+            answer, thinking = _agent_turn_extract(state.values.get("messages", []))
             self.call_from_thread(self._show_reply, answer, thinking)
         except Exception as e:  # 任何错误都进对话流，不打断界面
+            self._flush_answer()
             self.call_from_thread(self._show_error, str(e))
 
+    # ---------- 流式增量（worker 线程缓冲 → UI 线程刷新）----------
+
+    def _on_answer_delta(self, delta: str) -> None:
+        self._delta_buf += delta
+        if len(self._delta_buf) >= FLUSH_CHARS:
+            self._flush_answer()
+
+    def _flush_answer(self) -> None:
+        if self._delta_buf:
+            buf, self._delta_buf = self._delta_buf, ""
+            self.call_from_thread(self._append_answer, buf)
+
+    def _append_answer(self, delta: str) -> None:
+        self._live_text += delta
+        if self._live is None:
+            self._live = Static(Text(self._live_text), classes="assistant", id="live")
+            self._append(self._live)
+            self._status("回答生成中…")
+        else:
+            self._live.update(Text(self._live_text))
+        self.query_one("#chat", VerticalScroll).scroll_end(animate=False)
+
+    def _on_draft_delta(self, delta: str) -> None:
+        self._draft_buf += delta
+        if len(self._draft_buf) >= FLUSH_CHARS:
+            buf, self._draft_buf = self._draft_buf, ""
+            self.call_from_thread(self._append_draft, buf)
+
+    def _append_draft(self, delta: str) -> None:
+        self._draft_text += delta
+        if self._draft_coll is None:
+            self._draft_body = Static(Text(self._draft_text), classes="thinking")
+            self._draft_coll = Collapsible(
+                self._draft_body, title="内部草稿（生成中…）", collapsed=False
+            )
+            self._append(self._draft_coll)
+        else:
+            self._draft_body.update(Text(self._draft_text))
+        self.query_one("#chat", VerticalScroll).scroll_end(animate=False)
+
+    def _flush_all(self) -> None:
+        self._flush_answer()
+        if self._draft_buf:
+            buf, self._draft_buf = self._draft_buf, ""
+            self.call_from_thread(self._append_draft, buf)
+
+    # ---------- 完成 / 出错 ----------
+
     def _show_reply(self, reply: str, thinking: dict) -> None:
-        self._add_thinking(thinking)
-        self._append(Markdown(reply or "（空回复）", classes="assistant"))
+        self._add_thinking(thinking, skip_draft=self._draft_coll is not None)
+        self._finish_live(reply)
         self._busy = False
         self._status("")
         self.query_one("#prompt", Input).focus()
@@ -206,13 +293,28 @@ class ChatApp(App):
         self._busy = False
         self._status("")
 
+    def _finish_live(self, reply: str) -> None:
+        """Live 文本区替换为 Markdown 正式渲染；草稿折叠块自动收起。"""
+        if self._live is not None:
+            self._live.remove()
+            self._live = None
+            self._live_text = ""
+        if self._draft_coll is not None:
+            try:
+                self._draft_coll.title = "内部草稿"
+                self._draft_coll.collapsed = True  # 思考过程自动收纳
+            except Exception:
+                pass
+            self._draft_coll = None
+        self._append(Markdown(reply or "（空回复）", classes="assistant"))
+
     # ---------- 思考过程收纳 ----------
 
-    def _add_thinking(self, thinking: dict) -> None:
+    def _add_thinking(self, thinking: dict, skip_draft: bool = False) -> None:
         parts = []
         if thinking.get("reasoning"):
             parts.append(("思考过程（模型 reasoning）", thinking["reasoning"]))
-        if thinking.get("draft"):
+        if thinking.get("draft") and not skip_draft:  # 流式时草稿已实时展示过
             parts.append(("内部草稿（chat 两阶段）", thinking["draft"]))
         trace = thinking.get("trace") or []
         if trace:
@@ -222,10 +324,11 @@ class ChatApp(App):
                 lines.append(f"{i}. {t['tool']}({args})\n   → {t['result']}")
             parts.append((f"工具调用轨迹（{len(trace)} 次）", "\n".join(lines)))
         for title, body in parts:
+            # 思考块排在回答前面（Live 区可能已在对话流里）
             self._append(Collapsible(
                 Static(Text(body), classes="thinking"),
                 title=title, collapsed=True,
-            ))
+            ), before=self._live)
 
     # ---------- shell 审批 ----------
 
