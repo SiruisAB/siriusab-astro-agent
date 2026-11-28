@@ -1,7 +1,7 @@
-langchain>=1.0
+langchain>=1.3.3
 langchain-core>=1.0
 langchain-openai>=1.0
-langgraph>=1.0
+langgraph>=1.2.24
 langgraph-checkpoint-sqlite
 deepagents>=0.7
 python-dotenv
@@ -10,6 +10,10 @@ textual>=1.0
 aiohttp>=3.10
 markdown-it-py>=3.0
 Pygments>=2.17
+jsonschema>=4.18
+PyYAML>=6.0
+# qwen_runtime.py 直接导入（langchain-core 的传递依赖，但显式声明避免上游变更后断裂）
+pydantic>=2.0
 
 # 可选：serve.py 把对话界面投到浏览器时需要
 textual-serve>=0.7
@@ -28,3 +32,6 @@ pypdfium2>=4.0
 python-docx>=1.1
 openpyxl>=3.1
 python-pptx>=0.6
+
+# 可选：SANDBOX_MODE=1 的 polyglot 投递（把任意文件包成合法 PNG）需要 Pillow
+# pillow>=10.0

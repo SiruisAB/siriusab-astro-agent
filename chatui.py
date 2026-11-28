@@ -39,6 +39,7 @@ from main import (
 from agent_turn import run_agent_turn
 from browser import BrowserScreen
 from chatstore import ChatHistoryChanged
+from hitl import normalize_interrupt, resume_values, terminal_answer, terminal_prompt, validate_response
 from viewer import make_tree, parse_range, view_renderable
 
 STREAM_REFRESH_INTERVAL = 0.05  # 按时间合并流式更新，短片段也能及时显示
@@ -214,6 +215,9 @@ class ChatApp(App):
         event.input.clear()
         if not text:
             return
+        if text.split(None, 1)[0].lower() in {"/compact", "/resume"}:
+            self._run_command(text)
+            return
         if self.awaiting_approval is not None:  # 审批优先于一切
             self._resolve_approval(text)
             return
@@ -225,8 +229,9 @@ class ChatApp(App):
             return
         self._ask(text)
 
-    def _ask(self, text: str) -> None:
-        self._append(Static(Text(text), classes="user"))
+    def _ask(self, text: str | None) -> None:
+        if text is not None:
+            self._append(Static(Text(text), classes="user"))
         self._busy = True
         self._live = None
         self._live_text = ""
@@ -242,7 +247,7 @@ class ChatApp(App):
     # ---------- 后台执行（线程 worker）----------
 
     @work(thread=True)
-    def _run_turn(self, question: str) -> None:
+    def _run_turn(self, question: str | None) -> None:
         try:
             if self.mode == "chat":
                 reply, thinking = session_chat_reply(
@@ -266,14 +271,17 @@ class ChatApp(App):
                 agents[mode] = {"agent": agent, "config": config,
                                 "custom": current_custom, "model": self.ctx["current"]}
             rec = agents[mode]
-            def approve(req):
-                decisions: queue.Queue = queue.Queue()
-                self.call_from_thread(self._ask_approval, req, decisions)
-                return [decisions.get()]
+            def review(items):
+                values = []
+                for index, item in enumerate(items):
+                    replies: queue.Queue = queue.Queue()
+                    self.call_from_thread(self._ask_approval, normalize_interrupt(item, index), replies)
+                    values.append(replies.get())
+                return resume_values(items, values)
 
             answer, thinking = run_agent_turn(
-                rec["agent"], rec["config"], [{"role": "user", "content": question}],
-                on_answer=self._on_answer_delta, on_approval=approve,
+                rec["agent"], rec["config"], None if question is None else [{"role": "user", "content": question}],
+                on_answer=self._on_answer_delta, on_interrupts=review,
             )
             note = self._fetch_artifacts(answer)
             self.call_from_thread(self._show_reply, answer, thinking, note)
@@ -407,33 +415,39 @@ class ChatApp(App):
 
     def _ask_approval(self, req, q: "queue.Queue") -> None:
         self._flush_stream()
-        _reqs = (req or {}).get("action_requests") or [] if isinstance(req, dict) else []
-        self._approval_tool = (_reqs[0].get("name") if _reqs else None) or "run_powershell"
-        desc = req.get("description") if isinstance(req, dict) else str(req)
-        self._append(Static(Text(
-            f"[请求执行命令，请审批]\n{desc or req}\n"
-            "y=批准 / n=拒绝 / 直接输入替代命令",
-            style="yellow",
-        ), classes="user"))
-        self.awaiting_approval = {"queue": q}
-        self._status("等待审批…")
+        self.awaiting_approval = {"queue": q, "request": req, "index": 0, "decisions": []}
+        self._show_pending_question()
         self.query_one("#prompt", Input).focus()
 
+    def _show_pending_question(self):
+        current = self.awaiting_approval
+        self._append(Static(Text(terminal_prompt(current["request"], current["index"]), style="yellow"), classes="user"))
+        self._status("等待你的审批或回答…")
+
     def _resolve_approval(self, choice: str) -> None:
-        q = self.awaiting_approval["queue"]
+        current = self.awaiting_approval
+        request, index = current["request"], current["index"]
+        try:
+            value = terminal_answer(request, choice, index)
+            if request["type"] == "approval":
+                action_request = {**request, "actions": [request["actions"][index]], "protocol": "batched", "response_schema": None}
+                validate_response(action_request, [value])
+                proposed = [*current["decisions"], value]
+                if len(proposed) < len(request["actions"]):
+                    current["decisions"] = proposed
+                    current["index"] += 1
+                    self._show_pending_question()
+                    return
+                value = validate_response(request, proposed)
+            else:
+                value = validate_response(request, value)
+        except (ValueError, TypeError) as exc:
+            self._notice(str(exc))
+            return
         self.awaiting_approval = None
-        if choice.lower() == "y":
-            decision = {"type": "approve"}
-        elif choice.lower() == "n":
-            decision = {"type": "reject",
-                        "message": "用户拒绝了这条命令，请改用其他方式完成，或询问用户怎么办。"}
-        else:
-            decision = {"type": "edit",
-                        "edited_action": {"name": getattr(self, "_approval_tool", "run_powershell"),
-                                          "args": {"command": choice}}}
         self._append(Static(Text(f"[审批] {choice}", style="yellow"), classes="thinking"))
         self._status("继续执行…")
-        q.put(decision)
+        current["queue"].put(value)
 
     # ---------- 斜杠命令 ----------
 
@@ -445,10 +459,36 @@ class ChatApp(App):
             self._reload_chat_area()
         return out
 
+    @work(thread=True)
+    def _compact_context(self, text: str) -> None:
+        from main import compact_command
+
+        try:
+            result = compact_command(text, self.mode, self.ctx)
+            self.call_from_thread(self._notice, result["text"])
+        except Exception as exc:
+            self.call_from_thread(self._notice, f"压缩失败：{exc}")
+        finally:
+            def finish():
+                self._busy = False
+                self._status("")
+            self.call_from_thread(finish)
+
     def _run_command(self, text: str) -> None:
         cmd = text.split(None, 1)[0].lower()
         if self._busy and cmd not in _READ_ONLY_COMMANDS:
             self._notice(_BUSY_MESSAGE)
+            return
+        if cmd == "/compact":
+            self._busy = True
+            self._status("正在压缩上下文…")
+            self._compact_context(text)
+            return
+        if cmd == "/resume":
+            if self.mode == "chat":
+                self._notice("Chat 没有待恢复的工具任务；请切换到任务模式。")
+            else:
+                self._ask(None)
             return
         if cmd == "/view":
             args = text.split()
@@ -501,6 +541,9 @@ class ChatApp(App):
         cmd = text.split(None, 1)[0].lower()
         if self._busy and cmd not in _READ_ONLY_COMMANDS:
             return _BUSY_MESSAGE
+        if cmd in {"/compact", "/resume"}:
+            self._run_command(text)
+            return "正在压缩上下文…" if cmd == "/compact" else "正在恢复任务…"
         if cmd == "/session":
             return self._session_command(text)
         if cmd == "/view":

@@ -5,10 +5,11 @@
 所有工具返回字符串（出错也返回错误说明，让模型自己纠正）。
 """
 
-import astropy.units as u
 import hashlib
 import json
 import os
+import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -21,9 +22,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
-from astropy.utils.iers import conf as iers_conf
-from astropy.coordinates import AltAz, EarthLocation, SkyCoord
 from langchain_core.messages import (
+    AIMessage,
     HumanMessage,
     RemoveMessage,
     SystemMessage,
@@ -34,17 +34,12 @@ from langchain_core.messages import (
 from langchain_core.tools import InjectedToolCallId
 from langchain.tools import ToolRuntime, tool
 from langgraph.prebuilt import InjectedState
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
+from langgraph.errors import GraphBubbleUp
+from hitl import UserAnswer
 
-# 不在线下载 IERS 地球自转表，用 astropy 内置表（精度到角秒级，天文问答足够用），
-# 既避免下载失败刷警告，也让地平坐标计算完全离线可用
-iers_conf.auto_download = False
-from astropy.time import Time
-from astroquery.simbad import Simbad
-
-# CDS 主站（simbad.cds.unistra.fr）正在迁移，/simbad 路径暂时 404。
-# 官方公告指定哈佛镜像为替代端点，接口和数据完全一致。
-Simbad.server = "simbad.harvard.edu"
+# Astronomy libraries are loaded only when an astronomy tool is actually used.
+# File, shell, history and literature workflows do not need their startup cost.
 
 # ========== 防线一：可恢复引用（Manus 思想）==========
 # 大结果落盘 results/，上下文只留"摘要前缀 + 引用路径"——
@@ -75,6 +70,12 @@ def query_object(name: str) -> str:
     name 用英文通用名或编号，如 "Vega"、"M31"、"NGC 1277"。
     """
     try:
+        import astropy.units as u
+        from astropy.coordinates import SkyCoord
+        from astroquery.simbad import Simbad
+
+        # Keep the existing Harvard mirror; do not use the migrating CDS endpoint.
+        Simbad.server = "simbad.harvard.edu"
         table = Simbad.query_object(name)
         if table is None or len(table) == 0:
             return f"SIMBAD 中未找到天体: {name}（试试英文名或星表编号，如 M31、HD 172167）"
@@ -97,6 +98,9 @@ def query_object(name: str) -> str:
 def angular_separation(name1: str, name2: str) -> str:
     """计算两个天体在天球上的角距离，单位为度。参数为天体名称（英文/编号）。"""
     try:
+        import astropy.units as u
+        from astropy.coordinates import SkyCoord
+
         c1 = SkyCoord.from_name(name1)
         c2 = SkyCoord.from_name(name2)
         sep = c1.separation(c2).to(u.deg)
@@ -113,6 +117,13 @@ def altitude_azimuth(name: str, lat: float, lon: float) -> str:
     lat / lon: 观测者的纬度、经度，十进制度（东经为正、北纬为正），如北京 lat=39.9, lon=116.4
     """
     try:
+        import astropy.units as u
+        from astropy.coordinates import AltAz, EarthLocation, SkyCoord
+        from astropy.time import Time
+        from astropy.utils.iers import conf as iers_conf
+
+        # Keep the calculation offline: use the bundled Earth rotation table.
+        iers_conf.auto_download = False
         coord = SkyCoord.from_name(name)
         now = Time.now()
         place = EarthLocation(lat=lat * u.deg, lon=lon * u.deg)
@@ -273,6 +284,24 @@ def _thread_of(runtime: ToolRuntime | None) -> str:
     return str(tid) if tid else "unknown"
 
 
+def _session_memory(runtime):
+    """Logical conversation scope is separate from the durable per-run checkpoint thread."""
+    cfg = (getattr(runtime, "config", None) or {}).get("configurable", {}) if runtime else {}
+    if cfg.get("conversation_id") and cfg.get("memory_db"):
+        from chatstore import ChatStore
+        return ChatStore(cfg["memory_db"]), cfg["conversation_id"], cfg
+    return None
+
+
+def _archive_for_runtime(runtime, summary, messages):
+    memory = _session_memory(runtime)
+    if memory:
+        store, sid, cfg = memory
+        return store.archive_messages(sid, messages, run_id=cfg.get("run_id", ""),
+                                      thread_id=_thread_of(runtime), kind="compact", summary=summary)
+    return _archive_block(_thread_of(runtime), summary, messages)
+
+
 def _archive_block(thread_id: str, summary: str, messages: list) -> str:
     """把消息无损归档，返回 block_id。任何一步失败都抛异常（调用方据此中止压缩）。"""
     raw = json.dumps(
@@ -338,7 +367,10 @@ def _plan_compression(msgs: list) -> tuple[list, str]:
     按「用户轮次」而不是「消息条数」保护最近内容：一轮 agent 调用会产生
     多条 AI/Tool 消息，用固定条数做保护区很容易切在半路。
     """
-    turn_starts = [i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)]
+    turn_starts = [i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)
+                   and not m.additional_kwargs.get("interaction_answer")
+                   and not m.additional_kwargs.get("retrieval_context")
+                   and not m.additional_kwargs.get("context_summary")]
     if len(turn_starts) <= _PROTECT_TURNS:
         return [], f"只有 {len(turn_starts)} 个对话轮次（保护区 {_PROTECT_TURNS} 轮），无需压缩"
 
@@ -367,7 +399,6 @@ def compress(
     或用 search_context 免解压检索。
     """
     msgs = list(state.get("messages", []))
-    thread_id = _thread_of(runtime)
 
     targets, reason = _plan_compression(msgs)
     if not targets:
@@ -387,7 +418,7 @@ def compress(
 
     # 先归档，成功后才动上下文；归档失败则一条消息都不删
     try:
-        block_id = _archive_block(thread_id, summary, removable)
+        block_id = _archive_for_runtime(runtime, summary, removable)
     except Exception as e:
         return Command(update={"messages": [ToolMessage(
             f"压缩中止：原文归档失败（{type(e).__name__}: {e}）。"
@@ -401,7 +432,7 @@ def compress(
             f"[压缩块 {block_id}]（{len(removable)} 条历史已无损归档；"
             f"decompress('{block_id}') 取回完整原文，search_context 可免解压检索）\n"
             f"{summary}"
-        )
+        ), additional_kwargs={"context_summary": True}
     ))
     updates.append(ToolMessage(
         content=(
@@ -418,13 +449,31 @@ def compress(
 def decompress(block_id: str, runtime: ToolRuntime = None) -> str:
     """按 block_id（如 b1a2b3c4d5e6）取回某个压缩块的完整原文，不截断。
 
+    工作台也支持 search_context 返回的 m消息ID@修订号、b原文块ID#消息序号。
     恢复会占用较多上下文，只在确实需要核对细节（原始数值、完整工具输出、
     报错全文）时调用；只想确认某件事是否存在时先用 search_context。
     """
     thread_id = _thread_of(runtime)
+    memory = _session_memory(runtime)
     try:
-        messages = _load_block(thread_id, block_id)
-    except KeyError:
+        if memory and block_id.startswith("b") and "#" in block_id:
+            bid, position = block_id.split("#", 1)
+            index = int(position) - 1
+            originals = memory[0].memory_block(memory[1], bid)
+            if not 0 <= index < len(originals):
+                raise LookupError("原文块消息不存在")
+            messages = messages_from_dict([originals[index]])
+        elif memory and block_id.startswith("m"):
+            mid, _, revision = block_id.partition("@")
+            source = memory[0].original_message(memory[1], mid, int(revision) if revision else None)
+            cls = HumanMessage if source["role"] == "human" else AIMessage
+            messages = [cls(content=source["content"], additional_kwargs=source["metadata"])]
+        else:
+            messages = messages_from_dict(memory[0].memory_block(memory[1], block_id)) if memory else _load_block(thread_id, block_id)
+    except LookupError:
+        if memory:
+            ids = ", ".join(item["block_id"] for item in memory[0].memory_state(memory[1])["blocks"]) or "无"
+            return f"未找到块 {block_id}。当前会话已有块: {ids}"
         with closing(_blocks_conn()) as db:
             rows = db.execute(
                 "SELECT block_id FROM context_blocks WHERE thread_id = ? ORDER BY created",
@@ -462,6 +511,13 @@ def search_context(keyword: str, runtime: ToolRuntime = None) -> str:
     kw = (keyword or "").strip()
     if not kw:
         return "请给出要搜索的关键词"
+    memory = _session_memory(runtime)
+    if memory:
+        try:
+            result = memory[0].search_memory(memory[1], kw)
+            return result or f"当前会话的归档中未找到: {kw}"
+        except (ValueError, LookupError) as exc:
+            return f"检索原文失败：{exc}"
     like = f"%{kw}%"
     with closing(_blocks_conn()) as db:
         rows = db.execute(
@@ -507,8 +563,40 @@ def get_tools(subset: str = "all"):
     if subset == "query":
         return [*query_tools, *literature_tools]
     if subset == "research":
-        return [*query_tools, *literature_tools, *context_tools]
-    return [*query_tools, *literature_tools, *context_tools, run_powershell, run_bash]
+        return [*query_tools, *literature_tools, *context_tools, ask_user]
+    return [*query_tools, *literature_tools, *context_tools, ask_user, ssh_read, run_powershell, run_bash]
+
+
+@tool
+def ask_user(question: str, options: list[str] | None = None) -> str:
+    """需要用户选择服务器、数据范围或分析方案时提问并暂停，获得回答后继续。
+
+    question 应是具体、简短的问题；options 是可选的候选答案。不要用于批准命令执行。
+    """
+    if not question.strip():
+        return "请提供具体的问题"
+    response = interrupt({"type": "question", "question": question, "options": options or []},
+                         response_schema=UserAnswer)
+    return response["answer"]
+
+
+@tool
+def ssh_read(host: str, path: str = ".", operation: str = "list") -> str:
+    """通过 SSH 只读查看服务器目录或文本，无需逐次命令审批。
+
+    host 使用用户提供的 SSH 别名或主机地址；未知时先调用 ask_user。
+    operation 仅支持 list（列目录）、read（读前200行）、stat（文件信息）。
+    修改、删除、执行脚本等操作应使用需要审批的 shell 工具。
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@-]*", host):
+        return "SSH 主机必须是有效的别名或 user@hostname，不能包含命令或选项"
+    if not isinstance(path, str) or "\x00" in path:
+        return "无效的远程路径"
+    commands = {"list": ["ls", "-la", "--"], "read": ["head", "-n", "200", "--"], "stat": ["stat", "--"]}
+    if operation not in commands:
+        return "仅支持 list、read、stat 三种只读操作"
+    command = " ".join(shlex.quote(value) for value in [*commands[operation], path])
+    return _run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command], "SSH")
 
 
 # ========== Shell 执行工具（高危能力：main.py 中已配置人工审批） ==========
@@ -557,6 +645,8 @@ def _run(cmd_list: list, label: str) -> str:
         return f"[退出码 {result.returncode}]\n{output}"
     except subprocess.TimeoutExpired:
         return f"命令超时（>{_TIMEOUT_SECONDS} 秒），已中断"
+    except GraphBubbleUp:
+        raise
     except Exception as e:
         return f"{label} 执行失败: {e}"
 

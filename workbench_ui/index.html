@@ -4,34 +4,50 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#13151c">
   <title>天文 Agent</title>
+  <link rel="icon" href="/ui/assets/lyra.ico" sizes="any">
+  <link rel="icon" type="image/png" href="/ui/assets/lyra-32.png" sizes="32x32">
+  <link rel="apple-touch-icon" href="/ui/assets/lyra-180.png" sizes="180x180">
+  <link rel="manifest" href="/ui/manifest.webmanifest">
   <link rel="stylesheet" href="/ui/style.css">
   <script src="/ui/app.js" defer></script>
+  <script src="/ui/experiments.js" defer></script>
 </head>
 <body>
   <div class="app">
     <aside class="rail" id="sidebar" aria-label="会话">
-      <div class="brand"><span class="brand-mark" aria-hidden="true">✧</span><span>天文 Agent</span></div>
+      <div class="brand">
+        <img class="brand-mark" src="/ui/assets/lyra-64.png" width="38" height="38" alt="" aria-hidden="true">
+        <div class="brand-copy"><span>天文 Agent</span><a class="image-credit" href="https://commons.wikimedia.org/wiki/File:LyraCC.jpg" target="_blank" rel="noopener noreferrer" title="天琴座摄影：Till Credner · CC BY-SA 3.0；已裁剪与增强">天琴座 · Lyra</a></div>
+      </div>
       <nav class="nav" aria-label="工作模式">
-        <button class="nav-item" id="nav-task" aria-pressed="true"><span aria-hidden="true">◇</span>任务</button>
-        <button class="nav-item" id="nav-chat" aria-pressed="false"><span aria-hidden="true">◌</span>Chat</button>
+        <button class="nav-item" id="nav-task" aria-pressed="true"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#task"></use></svg>任务</button>
+        <button class="nav-item" id="nav-chat" aria-pressed="false"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#chat"></use></svg>Chat</button>
       </nav>
-      <div class="history-head"><h2>会话</h2><button id="new" class="icon" aria-label="新建会话" title="新建会话">＋</button></div>
+      <div class="history-head"><h2>会话</h2><button id="new" class="icon" aria-label="新建会话" title="新建会话"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#plus"></use></svg></button></div>
       <div id="sessions" class="sessions"></div>
+      <button id="experiment-nav" class="settings-nav" type="button" aria-haspopup="dialog"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#task"></use></svg>科研实验</button>
+      <button id="web-nav" class="settings-nav" type="button" title="打开官网、手动登录与实时查看网页顾问">网页 AI · 实时查看</button>
+      <button id="settings-nav" class="settings-nav" type="button"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#settings"></use></svg>设置</button>
       <div class="root-label"><span class="status-dot"></span><span id="root">本地工作区</span></div>
     </aside>
-    <div class="splitter" id="split-rail" role="separator" aria-orientation="vertical" aria-label="???????" aria-controls="sidebar" tabindex="0"></div>
+    <div class="splitter" id="split-rail" role="separator" aria-orientation="vertical" aria-label="调整会话栏宽度" aria-controls="sidebar" tabindex="0"></div>
     <main class="main">
       <header class="top">
-        <button class="icon mobile-toggle" id="sidebar-toggle" aria-expanded="false" aria-controls="sidebar" aria-label="会话">☰</button>
+        <button class="icon mobile-toggle" id="sidebar-toggle" aria-expanded="false" aria-controls="sidebar" aria-label="会话"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#menu"></use></svg></button>
         <h1 id="title">新任务</h1>
         <span id="status" role="status" class="status"></span>
-        <button id="panel-toggle" class="icon" aria-expanded="true" aria-controls="panel" aria-label="显示或隐藏工作区" title="工作区">▤</button>
+        <button id="top-stop" class="small-button stop-button" type="button" hidden>停止</button>
+        <button id="memory-open" class="small-button" type="button" title="摘要版本、修订、回退与原文">记忆</button>
+        <button id="skills-open" class="small-button" type="button" title="导入、审阅与选择 SKILL.md 技能">技能</button>
+        <button id="settings-open" class="icon" type="button" aria-label="设置" title="设置"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#settings"></use></svg></button>
+        <button id="panel-toggle" class="icon" aria-expanded="true" aria-controls="panel" aria-label="显示或隐藏工作区" title="工作区"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#panel"></use></svg></button>
       </header>
       <div id="timeline" class="timeline" tabindex="0" aria-label="对话消息">
         <div class="stream">
           <section id="welcome" class="welcome">
-            <div class="welcome-icon" aria-hidden="true">✧</div>
+            <img class="welcome-icon" src="/ui/assets/lyra-192.png" width="80" height="80" alt="" aria-hidden="true">
             <h2 id="welcome-title">今天想研究什么？</h2>
             <p id="welcome-text">让 Agent 检索资料、分析数据或处理工作区文件。</p>
             <div id="suggestions" class="suggestions"></div>
@@ -41,6 +57,7 @@
       </div>
       <div class="composer-wrap">
         <form id="composer" class="composer">
+          <div id="skills-selected" class="skill-selection" hidden></div>
           <div id="attachments" class="attachments" hidden></div>
           <textarea id="prompt" rows="3" maxlength="48000" placeholder="描述你要完成的任务…" aria-label="输入消息"></textarea>
           <div class="composer-controls">
@@ -50,41 +67,273 @@
               <option value="code">代码工程</option>
             </select>
             <select id="model" aria-label="模型"></select>
+            <select id="qwen-reasoning" aria-label="Qwen 本轮推理强度" title="此服务模型并发为 1；仅本轮生效，发送后恢复无思考。压缩固定使用无思考。" hidden>
+              <option value="none">无思考 · 并发 1</option>
+              <option value="xhigh">深度复核 · 本轮</option>
+            </select>
             <div class="spacer"></div>
-            <button type="submit" id="send" class="send" aria-label="发送" title="发送（Enter）">↑</button>
+            <button type="button" id="stop" class="small-button stop-button" title="请求停止；已执行操作不会撤销，已开始的工具需安全退出" hidden>停止</button>
+            <button type="button" id="interrupt-send" class="small-button" title="停止当前轮，确认停止后用输入框中的补充继续；不会撤销已执行操作" hidden>停止并补充</button>
+            <button type="submit" id="send" class="send" aria-label="发送" title="发送（Enter）"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#send"></use></svg></button>
           </div>
         </form>
-        <div class="usage" aria-label="??????????">
-          <span title="?? token ???????????? token ??">?? <output id="usage-rate">?</output></span>
-          <span title="??????????? token ????????????">??? <output id="usage-context">?</output></span>
-          <span title="???? token ?????? token ???">???? <output id="usage-cache">?</output></span>
+        <div class="usage" aria-label="模型用量统计">
+          <span title="最近一次调用的平均输出速率（每秒 token 数）">速率 <output id="usage-rate">?</output></span>
+          <span title="最近一次调用的输入 token 数，配置了上下文窗口时显示占比">上下文 <output id="usage-context">?</output></span>
+          <span title="缓存读取的 token 数及其占输入 token 的比例">缓存读取 <output id="usage-cache">?</output></span>
         </div>
         <p class="hint" id="hint"></p>
+        <p class="hint engine-status" id="engine-status" role="status" hidden></p>
       </div>
     </main>
-    <div class="splitter" id="split-panel" role="separator" aria-orientation="vertical" aria-label="????????" aria-controls="panel" tabindex="0"></div>
+    <div class="splitter" id="split-panel" role="separator" aria-orientation="vertical" aria-label="调整右侧面板宽度" aria-controls="panel" tabindex="0"></div>
     <aside id="panel" class="panel" aria-label="工作区">
       <div class="panel-tabs" aria-label="工作区内容">
         <button id="activity-tab" aria-pressed="true" aria-controls="activity">执行记录</button>
         <button id="files-tab" aria-pressed="false" aria-controls="files">文件</button>
+        <button id="web-tab" aria-pressed="false" aria-controls="web-live">网页 AI</button>
       </div>
       <div id="activity" class="panel-body"><p class="muted" id="activity-empty">提交任务后，这里会显示执行进度和审批请求。</p><div id="events" class="events"></div></div>
       <div id="files" class="panel-body" hidden>
-        <div class="file-head"><span id="folder" class="mono">/</span><button id="up" class="icon" type="button" aria-label="上一级目录" title="上一级目录">↰</button><button id="refresh" class="icon" type="button" aria-label="刷新文件" title="刷新文件">↻</button></div>
+        <div class="file-head"><span id="folder" class="mono">/</span><button id="up" class="icon" type="button" aria-label="上一级目录" title="上一级目录"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#up"></use></svg></button><button id="refresh" class="icon" type="button" aria-label="刷新文件" title="刷新文件"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#refresh"></use></svg></button></div>
         <div id="file-list" class="file-list"></div>
       </div>
+      <section id="web-live" class="panel-body web-live" aria-label="网页 AI 实时查看" hidden>
+        <h2>官网与实时过程</h2>
+        <p class="muted">直接 CDP 接入，不是 MCP。登录在专用官网浏览器中完成，工作台不代填密码或验证码。</p>
+        <div class="web-live-buttons"><button id="web-live-login" type="button" class="small-button">打开专用浏览器登录</button><button id="web-live-connect" type="button" class="small-button">检查连接</button><button id="web-live-settings" type="button" class="small-button">浏览器 / 代理设置</button></div>
+        <p id="web-live-connection" class="muted" role="status">尚未检查连接。工作台端口默认 8765；CDP 控制端口默认 9222，不是登录认证端口。</p>
+        <label for="web-live-provider">网页顾问<select id="web-live-provider"><option value="all">全部</option><option value="chatgpt">ChatGPT</option><option value="claude">Claude</option><option value="gemini">Gemini</option></select></label>
+        <button id="web-live-refresh" type="button" class="small-button">刷新当前会话任务</button>
+        <div id="web-live-jobs" class="knowledge-list"></div>
+        <p id="web-live-status" class="muted" role="status">Code/Agent 发起网页顾问请求后，这里显示批准文本、发送状态和网页实时回复。</p>
+        <section id="web-live-detail" hidden>
+          <div class="web-live-buttons"><button id="web-live-focus" type="button" class="small-button">打开这次官网对话</button><button id="web-live-preview" type="button" class="small-button" aria-pressed="false">显示官网画面（只读）</button></div>
+          <p id="web-live-image-status" class="muted" role="status"></p>
+          <img id="web-live-image" class="web-live-image" alt="此任务官网页面的只读实时画面，不可在此输入" hidden>
+          <button id="web-live-enlarge" type="button" class="small-button" hidden>放大官网画面</button>
+          <details><summary>冻结发送文本（未批准时不会外发）</summary><pre id="web-live-request"></pre></details>
+          <h3>网页回复 · 未核验建议</h3><pre id="web-live-answer" aria-label="网页实时回复"></pre>
+        </section>
+        <p class="muted">官网因跨域限制不使用 iframe 嵌入。只读镜像约每 2 秒刷新，关闭此栏即停止；画面不落盘、不进入模型上下文。需要输入、滚动或登录时，请打开官网窗口。切换到官网后不要改写 Agent 正在发送的内容。</p>
+      </section>
     </aside>
-    <div class="splitter" id="split-viewer" role="separator" aria-orientation="vertical" aria-label="???????" aria-controls="viewer" tabindex="0"></div>
-    <aside id="viewer" class="viewer" aria-label="????" hidden>
+    <div class="splitter" id="split-viewer" role="separator" aria-orientation="vertical" aria-label="调整预览栏宽度" aria-controls="viewer" tabindex="0"></div>
+    <aside id="viewer" class="viewer" aria-label="文件预览" hidden>
       <div class="preview-head">
         <span id="filename" class="mono"></span>
-        <button id="attach" type="button" class="small-button" hidden>??</button>
-        <button id="viewer-expand" type="button" class="icon" aria-label="????" aria-pressed="false" title="????">?</button>
-        <button id="viewer-close" type="button" class="icon" aria-label="????" title="????">?</button>
+        <button id="attach" type="button" class="small-button" hidden>附加</button>
+        <button id="viewer-expand" type="button" class="icon" aria-label="放大预览" aria-pressed="false" title="放大预览"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#expand"></use></svg></button>
+        <button id="viewer-close" type="button" class="icon" aria-label="关闭预览" title="关闭预览"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#close"></use></svg></button>
       </div>
       <p id="preview-status" class="muted" hidden></p>
-      <pre id="file-text" tabindex="0" aria-label="????" hidden></pre>
+      <pre id="file-text" tabindex="0" aria-label="文件内容" hidden></pre>
     </aside>
   </div>
+  <dialog id="web-live-dialog" class="settings-dialog web-live-dialog" aria-labelledby="web-live-dialog-title">
+    <header class="settings-header"><h2 id="web-live-dialog-title">官网实时画面 · 只读</h2><button id="web-live-dialog-close" type="button" class="small-button">关闭</button></header>
+    <img id="web-live-dialog-image" alt="官网只读实时画面；交互请在原浏览器窗口进行">
+    <p class="muted">不是内嵌浏览器，不能在此输入。画面不保存、不发送给模型；密码或验证码页面会暂停显示。</p>
+  </dialog>
+  <dialog id="skills-dialog" class="settings-dialog" aria-labelledby="skills-title">
+    <header class="settings-header"><div><h2 id="skills-title">项目技能</h2><p>按需加载 SKILL.md 和包内资源；启用不增加工具权限，脚本仍须审批，不是代码沙箱。加载的说明与资源会随请求发送给当前模型。</p></div><button id="skills-close" type="button" class="icon" aria-label="关闭技能"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#close"></use></svg></button></header>
+    <div class="settings-body skills-layout">
+      <section class="skills-library" aria-label="技能列表">
+        <button id="skills-refresh" type="button" class="small-button">刷新本地目录</button>
+        <p id="skills-directory" class="muted mono"></p>
+        <div id="skills-list" class="settings-model-list"></div>
+        <details class="skill-import"><summary>导入技能</summary>
+          <p class="muted">导入只复制说明与资源，保留许可证，不执行脚本或安装依赖。同名目录不会被覆盖。</p>
+          <button id="skills-official" type="button" class="small-button">读取 Anthropic 官方目录</button>
+          <label for="skills-official-name">官方技能<select id="skills-official-name" disabled><option value="">先读取目录</option></select></label>
+          <button id="skills-import-official" type="button" class="small-button" disabled>导入所选官方技能</button>
+          <label for="skills-zip-name">ZIP 中的技能名（单技能包可留空）<input id="skills-zip-name" maxlength="64" placeholder="例如 pdf"></label>
+          <button id="skills-upload" type="button" class="small-button">上传本地 ZIP</button><input id="skills-zip" type="file" accept=".zip,application/zip" hidden>
+        </details>
+      </section>
+      <section class="skills-detail" aria-label="技能说明">
+        <p id="skills-empty" class="muted">先导入技能，或将完整目录复制到项目 skills/&lt;名称&gt;/SKILL.md，然后刷新。</p>
+        <div id="skills-detail" hidden>
+          <h3 id="skill-name"></h3><p id="skill-description"></p>
+          <p id="skill-origin" class="muted"></p><p id="skill-compatibility" class="muted"></p>
+          <p id="skill-checksum" class="muted mono"></p>
+          <button id="skill-enabled" type="button" class="small-button">审阅后启用</button>
+          <label class="settings-checkbox"><input id="skill-selected" type="checkbox">显式用于下一条消息（最多 3 个；发送后清除）</label>
+          <p class="muted">已启用技能也可由模型按任务自动选择。allowed-tools 仅展示，不作为免审批授权。</p>
+          <pre id="skill-content" tabindex="0" aria-label="完整 SKILL.md"></pre>
+          <details><summary>包内资源与脚本</summary><ul id="skill-resources"></ul></details>
+        </div>
+      </section>
+    </div>
+    <footer class="settings-footer"><p id="skills-feedback" role="status">先查看完整说明、来源和许可证，再启用。</p><button id="skills-done" type="button" class="small-button">完成选择</button></footer>
+  </dialog>
+  <dialog id="experiment-dialog" class="settings-dialog" aria-labelledby="experiment-title">
+    <header class="settings-header">
+      <div><h2 id="experiment-title">科研实验</h2><p id="experiment-scope-note"></p></div>
+      <button id="experiment-close" type="button" class="icon" aria-label="关闭科研实验"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#close"></use></svg></button>
+    </header>
+    <div class="settings-body experiment-layout">
+      <nav aria-label="实验记录" class="experiment-list">
+        <label>记录范围<select id="experiment-scope"><option value="session">当前会话与共享记录</option><option value="unlinked">未关联会话的计划</option><option value="project">项目全部记录（只读浏览）</option></select></label>
+        <div class="experiment-actions"><button id="experiment-new" type="button" class="small-button">新建计划</button><button id="experiment-refresh" type="button" class="small-button">刷新</button></div>
+        <div id="experiment-list" class="settings-model-list"></div>
+      </nav>
+      <div class="experiment-detail">
+        <p id="experiment-empty" class="muted">选择实验或建立新计划。</p>
+        <form id="experiment-plan" class="experiment-form" hidden>
+          <h3 id="experiment-plan-heading" tabindex="-1">新建实验计划</h3>
+          <label>实验名称<input id="experiment-name" maxlength="160" required></label>
+          <label>假设或目标<textarea id="experiment-hypothesis" rows="3" maxlength="6000" required></textarea></label>
+          <label>运行命令<textarea id="experiment-command" rows="2" maxlength="6000" required></textarea><span class="field-hint">冻结计划只登记命令。</span></label>
+          <div class="settings-fields">
+            <label>源码路径<textarea id="experiment-code" rows="3" required placeholder="scripts/analysis.py"></textarea><span class="field-hint">项目相对路径，每行一个，最多 16 个。</span></label>
+            <label>输入路径<textarea id="experiment-inputs" rows="3" placeholder="data/input.csv"></textarea><span class="field-hint">项目相对路径，每行一个，最多 16 个。</span></label>
+          </div>
+          <label>随机种子<input id="experiment-seed" inputmode="numeric" pattern="[0-9]+" maxlength="20" aria-describedby="experiment-seed-hint"><span id="experiment-seed-hint" class="field-hint">可留空，或输入 0 至 18446744073709551615 的整数。</span></label>
+          <div class="settings-fields">
+            <label>参数（JSON 对象）<textarea id="experiment-parameters" rows="3" placeholder='{"tolerance": "0.00000000000000000001"}'></textarea></label>
+            <label>单位（JSON 对象）<textarea id="experiment-units" rows="3" placeholder='{"energy": "keV"}'></textarea></label>
+          </div>
+          <p class="field-hint experiment-hint">需要保留精确小数时，请用 JSON 字符串。</p>
+          <label>硬件、数据来源和外部资源<textarea id="experiment-hardware" rows="2" maxlength="2000"></textarea></label>
+          <label class="settings-checkbox"><input id="experiment-shared" type="checkbox">共享记录，允许其他会话和 Agent 读取</label>
+          <div class="experiment-actions"><button type="submit" class="small-button experiment-primary">冻结计划</button><button id="experiment-plan-cancel" type="button" class="small-button">取消</button></div>
+        </form>
+        <section id="experiment-record" aria-labelledby="experiment-record-title" hidden>
+          <h3 id="experiment-record-title" tabindex="-1"></h3>
+          <p id="experiment-record-meta" class="muted"></p>
+          <dl id="experiment-summary" class="experiment-summary"></dl>
+          <details><summary>冻结文件、Git 与环境</summary><div id="experiment-baseline"></div></details>
+          <details id="experiment-outcome-panel" hidden><summary>运行与结果登记</summary><div id="experiment-outcome"></div></details>
+          <div class="experiment-actions">
+            <button id="experiment-check" type="button" class="small-button">检查当前条件</button>
+            <button id="experiment-fork" type="button" class="small-button">以此新建计划</button>
+            <button id="experiment-export" type="button" class="small-button">导出 ZIP</button>
+          </div>
+          <p id="experiment-export-note" class="field-hint">资料包包含冻结的源码。输入和结果文件以校验值记录。</p>
+          <section id="experiment-differences" aria-labelledby="experiment-check-title" hidden></section>
+          <form id="experiment-start" class="experiment-form experiment-registration" hidden>
+            <label class="settings-checkbox"><input id="experiment-start-confirm" type="checkbox" required>我已手动启动实验，确认这里只登记状态。</label>
+            <button type="submit" class="small-button experiment-primary">登记开始</button>
+          </form>
+          <form id="experiment-finish" class="experiment-form experiment-registration" hidden>
+            <div class="settings-fields">
+              <label>结果状态<select id="experiment-result-status"><option value="succeeded">成功</option><option value="failed">失败</option><option value="cancelled">已取消</option></select></label>
+              <label>退出码（可留空）<input id="experiment-exit" type="number" min="-2147483648" max="2147483647" step="1"></label>
+            </div>
+            <label>结果文件路径<textarea id="experiment-artifacts" rows="2"></textarea><span class="field-hint">项目相对路径，每行一个，最多 16 个。</span></label>
+            <label>结果指标（JSON 对象）<textarea id="experiment-metrics" rows="2"></textarea><span class="field-hint">需要保留精确小数时，请用 JSON 字符串。</span></label>
+            <label>结果说明<textarea id="experiment-notes" rows="2" maxlength="6000"></textarea></label>
+            <label class="settings-checkbox"><input id="experiment-finish-confirm" type="checkbox" required>我已核对运行结果，确认这里只登记结果。</label>
+            <button type="submit" class="small-button experiment-primary">登记结果</button>
+          </form>
+        </section>
+      </div>
+    </div>
+    <footer class="settings-footer"><p id="experiment-feedback" role="status"></p></footer>
+  </dialog>
+  <dialog id="memory-dialog" class="settings-dialog memory-dialog" aria-labelledby="memory-title">
+    <header class="settings-header"><div><h2 id="memory-title">会话记忆</h2><p>原文始终保留。修订会创建新版本；恢复仅切换下一轮使用的上下文。</p></div><button id="memory-close" type="button" class="icon" aria-label="关闭记忆"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#close"></use></svg></button></header>
+    <div class="settings-body memory-layout">
+      <nav aria-label="记忆版本"><h3>摘要版本</h3><div id="memory-versions" class="settings-model-list"></div><h3 class="memory-block-heading">工具原文</h3><div id="memory-blocks" class="settings-model-list"></div></nav>
+      <section class="memory-detail" aria-label="版本详情">
+        <details id="subagent-records" class="research-memory">
+          <summary>子 Agent 执行记录</summary>
+          <p class="muted">隔离的文献检索、证据核验，以及 Code/Agent 的测试编写；不继承 Shell 或其他会话。测试子 Agent 只读指定源码并返回未执行提案，应用与运行仍需审批。</p>
+          <button id="subagent-refresh" type="button" class="small-button">刷新子任务</button>
+          <div id="subagent-list" class="knowledge-list"></div>
+          <p id="subagent-feedback" class="muted" role="status"></p>
+          <pre id="subagent-report" hidden></pre>
+        </details>
+        <details id="research-memory" class="research-memory">
+          <summary>历史检索与科研知识</summary>
+          <p class="muted">按词检索原文；知识条目按天体别名或主题激活。原文一致不代表科学结论已核实。</p>
+          <form id="knowledge-search-form" class="memory-search-form"><label for="knowledge-query">搜索历史<input id="knowledge-query" maxlength="2000" placeholder="例如 M31、快速射电暴、1e40 erg、DOI" required></label><button id="knowledge-search" type="submit" class="small-button">检索</button></form>
+          <label class="settings-checkbox"><input id="knowledge-history" type="checkbox">包含历史修订和旧归档</label>
+          <p id="knowledge-feedback" role="status" class="muted"></p>
+          <div id="knowledge-hits" class="knowledge-hits"></div>
+          <details id="knowledge-source-panel" hidden><summary>所选来源完整原文</summary><pre id="knowledge-source"></pre></details>
+          <div class="knowledge-head"><h3>科研知识条目</h3><button id="knowledge-new" type="button" class="small-button">新建条目</button><button id="knowledge-reindex" type="button" class="small-button" title="只重建当前会话检索索引，不修改原文">重建索引</button></div>
+          <div id="knowledge-list" class="knowledge-list"></div>
+          <details id="knowledge-editor"><summary>知识条目编辑</summary>
+            <form id="knowledge-form" class="knowledge-form">
+              <input id="knowledge-entry-id" type="hidden"><input id="knowledge-revision" type="hidden">
+              <label for="knowledge-title">标题<input id="knowledge-title" maxlength="120" required placeholder="例如 M31 的观测参数"></label>
+              <label for="knowledge-keywords">触发词 / 别名<input id="knowledge-keywords" maxlength="1600" required placeholder="M31, 仙女座星系, Andromeda"></label>
+              <label for="knowledge-reference">原文来源 ID<input id="knowledge-reference" maxlength="100" required placeholder="检索后点击“用作知识来源”，或输入 m消息ID@修订号"></label>
+              <p id="knowledge-origin" class="muted"></p>
+              <label for="knowledge-quote">逐字原文摘录<textarea id="knowledge-quote" rows="4" maxlength="6000" required></textarea></label>
+              <label for="knowledge-note">备注（不视为已核验事实）<textarea id="knowledge-note" rows="2" maxlength="2000"></textarea></label>
+              <label for="knowledge-priority">优先级<input id="knowledge-priority" type="number" min="0" max="100" value="50" required></label>
+              <label class="settings-checkbox"><input id="knowledge-shared" type="checkbox">项目共享：允许其他会话在关键词命中时使用这条资料</label>
+              <button id="knowledge-save" type="submit" class="small-button">保存知识条目</button>
+            </form>
+          </details>
+        </details>
+        <p id="memory-meta" class="muted"></p>
+        <label for="memory-summary">摘要（可修订）</label><textarea id="memory-summary" maxlength="48000" rows="8"></textarea>
+        <details id="memory-diff-section"><summary>与父版本的差异</summary><pre id="memory-diff"></pre></details>
+        <details id="memory-sources-section"><summary>来源原文与消息标识</summary><pre id="memory-sources"></pre><div class="memory-pager"><button id="memory-prev" type="button" class="small-button">上一页</button><span id="memory-page"></span><button id="memory-next" type="button" class="small-button">下一页</button></div></details>
+      </section>
+    </div>
+    <footer class="settings-footer memory-footer"><p id="memory-feedback" role="status"></p><div class="approval-actions"><button id="memory-reset" class="small-button" type="button">使用完整上下文</button><button id="memory-restore" class="small-button" type="button">恢复所选版本</button><button id="memory-save" class="small-button" type="button">保存修订并启用</button></div></footer>
+  </dialog>
+  <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title">
+    <header class="settings-header"><div><h2 id="settings-title">工作台设置</h2><p>端口与模型配置保存在本机，不修改原来的 .env。</p></div><button id="settings-close" type="button" class="icon" aria-label="关闭设置"><svg class="ui-icon" aria-hidden="true"><use href="/ui/assets/icons.svg#close"></use></svg></button></header>
+    <form id="settings-form">
+      <div class="settings-body">
+        <section class="port-settings" aria-labelledby="port-title">
+          <div><h3 id="port-title">启动端口</h3><p id="settings-port-hint">修改后在下次启动时生效，当前会话不会中断。</p></div>
+          <label for="settings-port">端口<input id="settings-port" type="number" min="1" max="65535" step="1" required></label>
+        </section>
+        <details class="settings-advanced web-advisor-settings">
+          <summary>网页顾问 · ChatGPT / Claude / Gemini（实验功能，默认关闭）</summary>
+          <p class="muted">工作台保持主控，仅在 Code/Agent 中发送逐次审批的冻结文本。没有自动文件上传；网页回复只是建议，不能执行本地操作。</p>
+          <label class="settings-checkbox"><input id="settings-web-enabled" type="checkbox">启用网页顾问</label>
+          <div class="settings-fields">
+            <label for="settings-web-browser">浏览器类型<select id="settings-web-browser"><option value="dedicated">普通专用浏览器（Chrome / Edge）</option><option value="fingerprint">指纹浏览器（通用 Chromium / CDP 接入）</option></select><span id="settings-web-browser-hint" class="field-hint"></span></label>
+            <label for="settings-web-proxy-mode">网页访问代理<select id="settings-web-proxy-mode"><option value="system">跟随系统代理</option><option value="direct">直连（不使用浏览器代理）</option><option value="custom">指定本机代理</option></select><span class="field-hint">只影响网页浏览器，不修改本地/API 模型渠道。直连不能保证绕过 TUN / VPN 系统路由。</span></label>
+            <label id="settings-web-proxy-field" class="full-field" for="settings-web-proxy-url" hidden>本机代理地址<input id="settings-web-proxy-url" type="url" maxlength="200" placeholder="http://127.0.0.1:7890"><span class="field-hint">支持本机 HTTP / HTTPS / SOCKS5，填写你的实际监听端口；不支持在此填写代理账号密码。</span></label>
+            <label for="settings-web-cdp">本机 CDP 地址<input id="settings-web-cdp" type="url" maxlength="200" placeholder="http://127.0.0.1:9222"><span class="field-hint">仅允许回环地址。不要把浏览器调试端口开放到局域网或 Tailscale。</span></label>
+            <label for="settings-web-timeout">单次网页超时（秒）<input id="settings-web-timeout" type="number" min="30" max="600" step="1" value="180"></label>
+            <label for="settings-web-idle">空闲自动关闭专用浏览器（分钟）<input id="settings-web-idle" type="number" min="0" max="240" step="1" value="0"><span class="field-hint">0 = 不自动关闭。仅在普通专用浏览器模式下、且没有待审批或执行中的顾问任务时生效；只关闭本项目启动器打开的那个实例，不会关闭你手动打开的浏览器。</span></label>
+          </div>
+          <div class="approval-actions"><label class="settings-checkbox"><input id="settings-web-chatgpt" type="checkbox">ChatGPT</label><label class="settings-checkbox"><input id="settings-web-claude" type="checkbox">Claude</label><label class="settings-checkbox"><input id="settings-web-gemini" type="checkbox">Gemini</label></div>
+          <label id="settings-web-fingerprint-confirm-field" class="settings-checkbox" hidden><input id="settings-web-fingerprint-confirmed" type="checkbox">我已在指纹浏览器配置中应用上述代理方式并重新启动（工作台仅记录确认，不自动修改）</label>
+          <label class="settings-checkbox"><input id="settings-web-dedicated" type="checkbox">我确认使用专用浏览器配置，并自行登录、处理验证码及核对网站条款</label>
+          <p class="field-hint">保存设置不会启动或重启浏览器。普通浏览器的代理由“启动网页顾问.bat”在下次启动时应用；指纹浏览器需自行启动并配置代理。不会导出 Cookie 或切换网页模型；确认不代表后台已验证浏览器隔离或实际出站代理。</p>
+          <button id="web-advisor-refresh" type="button" class="small-button">查看当前会话的网页顾问任务</button>
+          <p id="web-advisor-feedback" role="status" class="field-hint"></p>
+          <div id="web-advisor-jobs" class="knowledge-list"></div>
+          <details id="web-advisor-detail" hidden><summary>顾问报告与冻结来源</summary><pre id="web-advisor-report"></pre><div id="web-advisor-actions" class="approval-actions"></div></details>
+        </details>
+        <div class="model-settings">
+          <section class="settings-model-sidebar" aria-labelledby="model-settings-title">
+            <div class="settings-model-head"><h3 id="model-settings-title">模型档案</h3><button id="settings-add" type="button" class="small-button">添加模型</button></div>
+            <div id="settings-model-list" class="settings-model-list"></div>
+          </section>
+          <section id="settings-editor" class="settings-editor" aria-label="模型配置">
+            <p id="settings-source" class="muted"></p>
+            <div class="settings-fields">
+              <label for="settings-model-id">档案 ID<input id="settings-model-id" type="text" maxlength="48" pattern="[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}" placeholder="例如 qwen 或 deepseek" required></label>
+              <label for="settings-label">显示名称<input id="settings-label" type="text" maxlength="100" placeholder="例如 本地 Qwen"></label>
+              <label for="settings-model" class="full-field">模型 ID<input id="settings-model" type="text" maxlength="256" placeholder="例如 qwen3.8-27b-coder390" required></label>
+              <label for="settings-api-type" class="full-field">接口类型<select id="settings-api-type"><option value="chat_completions">Chat Completions · /chat/completions（常用）</option><option value="responses">Responses · /responses</option><option value="auto">自动识别 · 按 URL 判断，默认 Chat</option></select></label>
+              <label for="settings-url" class="full-field">API URL<input id="settings-url" type="url" maxlength="2048" placeholder="https://api.example.com/v1；也可以粘贴完整接口地址"><span id="settings-endpoint-preview" class="field-hint"></span></label>
+              <label for="settings-key" class="full-field">API Key<input id="settings-key" type="password" maxlength="8192" autocomplete="new-password" spellcheck="false"><span id="settings-key-hint" class="field-hint"></span></label>
+            </div>
+            <label class="settings-checkbox"><input id="settings-no-key" type="checkbox">无需 Key（本地免鉴权服务）</label>
+            <details class="settings-advanced"><summary>高级配置</summary><div class="settings-fields">
+              <label for="settings-context">上下文窗口（token）<input id="settings-context" type="number" min="1" max="9999999" step="1" placeholder="留空使用 .env 或模型默认值"><span class="field-hint">自定义模型建议填写服务端的实际上限；未知时按消息条数触发压缩。</span></label>
+              <label for="settings-stream-usage">流式用量统计<select id="settings-stream-usage"><option value="auto">使用 .env / 默认设置</option><option value="true">启用</option><option value="false">禁用（端点不兼容时）</option></select></label>
+            </div></details>
+            <button id="settings-delete" type="button" class="small-button settings-delete">移除此模型</button>
+          </section>
+          <p id="settings-model-empty" class="muted" hidden>尚未配置模型，点击“添加模型”开始。</p>
+        </div>
+      </div>
+      <footer class="settings-footer"><p id="settings-feedback" role="status">Key 不会回显；留空保留现有 Key，新模型可沿用默认档案的 Key。</p><button id="settings-save" type="submit" class="small-button">保存设置</button></footer>
+    </form>
+  </dialog>
 </body>
 </html>

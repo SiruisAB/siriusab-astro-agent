@@ -1,0 +1,14 @@
+{
+  "name": "天文 Agent",
+  "short_name": "天文 Agent",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#13151c",
+  "theme_color": "#13151c",
+  "icons": [
+    {"src": "/ui/assets/lyra-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "/ui/assets/lyra-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"}
+  ]
+}

@@ -1,4 +1,5 @@
 @echo off
+setlocal
 chcp 65001 >nul
 cd /d "%~dp0"
 rem 兼容两种环境布局：conda 环境的 python.exe 在 .conda 根目录，venv 的在 .conda\Scripts 下
@@ -11,16 +12,25 @@ if not exist "%PY%" (
     pause
     exit /b 1
 )
-if not exist ".env" (
+if "%~1"=="" goto workbench
+if /i "%~1"=="--port" goto workbench
+if /i "%~1"=="--open" goto workbench
+if /i "%~1"=="--no-warmup" goto workbench
+if /i "%~1"=="--help" goto workbench
+if not exist ".env" if not exist ".workbench\settings.json" (
     echo [提示] 未找到 .env，正在从 .env.example 复制，请填入 API_KEY 后重新运行
     copy ".env.example" ".env" >nul
     pause
     exit /b 1
 )
-if "%~1"=="" (
-    echo 启动天文 Agent 工作台…
-    "%PY%" workspace.py --open
-) else (
-    "%PY%" main.py %*
-)
-pause
+"%PY%" main.py %*
+goto finished
+
+:workbench
+echo 启动天文 Agent 工作台，已有服务会直接复用…
+"%PY%" workspace.py --open %*
+
+:finished
+set "RC=%errorlevel%"
+if not "%RC%"=="0" pause
+exit /b %RC%

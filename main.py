@@ -25,12 +25,14 @@ import os
 import re
 import sqlite3
 import sys
+import uuid
 import zipfile
 from pathlib import Path
 
 from dotenv import load_dotenv
 from deepagents.backends import FilesystemBackend
 from deepagents.middleware import FilesystemMiddleware
+from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from langchain.agents import create_agent
 from langchain.agents.middleware import (
     HumanInTheLoopMiddleware,
@@ -45,11 +47,22 @@ from deepagents.middleware.summarization import SummarizationMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.types import Command
 
 from chatstore import PLACEHOLDER_TITLE, ChatHistoryChanged, ChatStore
+from compact import compact_focus, compact_session, compression_result, content_text, observe_qwen, plan_compaction, summarize, summary_message
+from model_endpoints import resolve_endpoint
 from tools import get_tools
+from approval_policy import interrupt_config
+from durable_tools import DurableToolResults
+from conversation_archive import ConversationArchive
+from prompt_layers import DATA_RULES, prepare_retrieval, retrieval_message, source_tool
+from research_subagents import DELEGATION_RULES, TOOL_NAMES as SUBAGENT_TOOL_NAMES, agent_tools as research_agent_tools, chat_tools as research_chat_tools
+from skill_runtime import SkillRuntime, skill_message
+from test_subagent import DELEGATION_RULES as TEST_DELEGATION_RULES, agent_tools as test_agent_tools
+from web_advisor import RULES as WEB_ADVISOR_RULES, agent_tools as web_advisor_tools
+from experiment_tools import RULES as EXPERIMENT_RULES, agent_tools as experiment_agent_tools
 from viewer import list_tree, parse_range, view_file
+from model_profiles import list_model_profiles
 
 # ========== 各模式的系统提示词 ==========
 
@@ -66,7 +79,7 @@ SYSTEM_PROMPT = (
     "当对话变得很长、早期内容不再需要逐字保留时，调用 compress 压缩旧历史"
     "（摘要必须保留数值结果、文件路径、关键决策），需要细节时 decompress 恢复。\n"
     "你还可以调用 run_powershell / run_bash 执行 shell 命令，用于文件操作、"
-    "运行脚本、调用本地工具等。注意：每条 shell 命令执行前用户都会被要求确认，"
+    "运行脚本、调用本地工具等。明确的只读命令可直接执行，其余命令与重要文件修改需要审批，"
     "若用户拒绝，请改用其他方式或直接询问用户意图；不要重复提交同一条被拒绝的命令。"
 )
 
@@ -533,7 +546,6 @@ def _ooxml_extract(data: bytes, name: str) -> dict:
 
 def _read_archive(path: Path, profile_name: str | None = None) -> dict:
     """解包压缩包，把里面的文本/图片整理成可注入的结构（纯内存，不落盘）。"""
-    import io
     import zipfile
 
     if path.stat().st_size > _ARCHIVE_MAX_BYTES:
@@ -1117,6 +1129,8 @@ HELP_TEXT = """
   /prompt <内容>                    为当前模式设置附加提示词（可有可无，叠加在默认提示词上）
   /param [参数] [数值]              chat 会话级采样参数：temp / top_p / max_tokens
                                     /param 查看 | /param reset 重置
+  /compact [保留重点]               手动压缩当前上下文，保留最近两轮与完整原始记录
+  /resume                           恢复当前任务中等待审批或回答的中断
   /session                          chat 多会话：查看列表 / new [标题] / <编号> 切换
                                     / rename <标题> / del <编号>（对话界面左侧也可点击切换）
   /file <路径> [更多…]              附加文件给模型（chat 模式：文本/源码/CSV/JSON/PDF/图片）
@@ -1136,63 +1150,55 @@ def compose_system(default_prompt: str, custom_prompt: str) -> str:
     return default_prompt
 
 
-def list_model_profiles() -> dict:
-    """扫描 .env 中配置的全部模型档案，返回 档案名 -> {model, api_key, base_url}。
-
-    约定：主档案无后缀（MODEL_NAME / API_KEY / BASE_URL），档案名固定 default；
-    附加档案加任意后缀，如 MODEL_NAME_DEEPSEEK / API_KEY_DEEPSEEK / BASE_URL_DEEPSEEK，
-    档案名即后缀的小写（deepseek）。API_KEY_<名字> 缺省时沿用主档案的 API_KEY。
-    """
-    load_dotenv()
-    profiles: dict = {}
-    for raw_key, value in os.environ.items():
-        key = raw_key.upper()
-        if not value:
-            continue
-        if key == "MODEL_NAME":
-            profiles["default"] = {
-                "model": value,
-                "api_key": os.environ.get("API_KEY"),
-                "base_url": os.environ.get("BASE_URL") or None,
-            }
-        elif key.startswith("MODEL_NAME_"):
-            name = key[len("MODEL_NAME_"):].lower()
-            profiles[name] = {
-                "model": value,
-                "api_key": os.environ.get(f"API_KEY_{name.upper()}") or os.environ.get("API_KEY"),
-                "base_url": os.environ.get(f"BASE_URL_{name.upper()}") or None,
-            }
-    # 只填了 API_KEY 没填 MODEL_NAME 时，主档案用默认模型名兜底
-    if "default" not in profiles and os.environ.get("API_KEY"):
-        profiles["default"] = {
-            "model": os.environ.get("MODEL_NAME", "gpt-4o-mini"),
-            "api_key": os.environ.get("API_KEY"),
-            "base_url": os.environ.get("BASE_URL") or None,
-        }
-    return profiles
-
-
 def build_model(profile: dict | None = None, *, model_class=ChatOpenAI, **options) -> ChatOpenAI:
     """构建模型实例（OpenAI 兼容协议）。profile 缺省时读 .env 主档案。"""
     load_dotenv()
     if profile is None:
-        profile = {
-            "model": os.environ.get("MODEL_NAME", "gpt-4o-mini"),
-            "api_key": os.environ.get("API_KEY"),
-            "base_url": os.environ.get("BASE_URL") or None,
+        profiles = list_model_profiles()
+        profile = profiles.get("default") or next(iter(profiles.values()), None) or {
+            "model": "gpt-4o-mini", "api_key": None, "base_url": None,
         }
     if not profile.get("api_key"):
         raise ValueError(
             f"模型档案 {profile.get('model', '?')} 缺少 API_KEY"
-            "（检查 .env 中的 API_KEY 或 API_KEY_<档案名>）"
+            "（请在工作台设置中填写 Key，或检查 .env 中的 API_KEY）"
         )
     options.setdefault("temperature", 0)
-    return model_class(
+    endpoint = resolve_endpoint(profile.get("base_url"), profile.get("api_type", "chat_completions"))
+    options.setdefault("use_responses_api", endpoint["api_type"] == "responses")
+    if options["use_responses_api"]:
+        options.setdefault("output_version", "responses/v1")
+        # Keep checkpoint replay local; never depend on retained provider response IDs.
+        options.setdefault("store", False)
+    # 上下文窗口元数据：SummarizationMiddleware 的 fraction 触发器需要它
+    # （langchain 只对注册表里的知名模型自带 profile，自定义模型名如
+    # qwen3.8-27b-coder390 必须显式传入，否则 build_agent 直接抛 ValueError）。
+    if "profile" not in options:
+        raw = str(profile.get("context_window") or os.environ.get("CONTEXT_WINDOW", ""))
+        if raw.isascii() and raw.isdecimal() and 0 < int(raw) <= 9_999_999:
+            options["profile"] = {"max_input_tokens": int(raw)}
+    if profile["model"].casefold() == "qwen3.8-27b-coder390":
+        from qwen_runtime import CONTEXT_WINDOW, guarded_model_class
+        if options["use_responses_api"]:
+            raise ValueError("此 Qwen 服务须选择 Chat Completions 接口")
+        options.setdefault("profile", {"max_input_tokens": CONTEXT_WINDOW})
+        options.setdefault("reasoning_effort", profile.get("reasoning_effort") or "none")
+        options.setdefault("max_tokens", 1024)
+        options["max_retries"] = 0
+        options["streaming"] = True
+        options["disable_streaming"] = False
+        options.setdefault("timeout", 120)
+        if isinstance(model_class, type) and issubclass(model_class, ChatOpenAI):
+            model_class = guarded_model_class(model_class)
+    model = model_class(
         model=profile["model"],
         api_key=profile["api_key"],
-        base_url=profile.get("base_url") or None,  # OpenAI 官方可不填
+        base_url=endpoint["base_url"],  # OpenAI 官方可不填
         **options,
     )
+    from turn_control import CURRENT
+    control = CURRENT.get()
+    return control.track_model(model) if control else model
 
 
 _CHECKPOINTER = None
@@ -1209,7 +1215,8 @@ def _get_checkpointer() -> SqliteSaver:
     return _CHECKPOINTER
 
 
-def build_agent(model: ChatOpenAI, mode: str, custom_prompt: str = "", *, checkpointer=None):
+def build_agent(model: ChatOpenAI, mode: str, custom_prompt: str = "", *, checkpointer=None, root_dir=None, on_subagent=None,
+                skill_scope=None, selected_skills=None, on_skill=None, on_web_advisor=None, cancelled=None, turn_control=None, on_experiment=None):
     """构建指定模式的 agent 实例，返回 (agent, config)。各模式记忆独立。
 
     middleware 组合（全部现成组件）：
@@ -1222,18 +1229,33 @@ def build_agent(model: ChatOpenAI, mode: str, custom_prompt: str = "", *, checkp
     - SummarizationMiddleware    历史超限时结构化摘要兜底
     """
     cfg = MODE_CONFIGS[mode]
-    project_dir = os.path.dirname(os.path.abspath(__file__))
+    project_dir = str(root_dir or Path(__file__).resolve().parent)
     _fs_backend = FilesystemBackend(root_dir=project_dir, virtual_mode=True)
+    metadata = getattr(model, "profile", None) or {}
+    # A new GUI-configured custom model may have no registered context limit.
+    # Keep it usable without inventing a token window; users can set its real limit.
+    summary_trigger = ("fraction", 0.8) if metadata.get("max_input_tokens") else ("messages", 40)
+    skills = SkillRuntime(project_dir, scope=skill_scope, on_event=on_skill)
+    selected_context = skills.selected(selected_skills)
+    from turn_control import control_middleware
     agent = create_agent(
         model=model,
-        tools=get_tools(cfg["tools"]) if cfg["tools"] else [],
-        system_prompt=compose_system(cfg["prompt"], custom_prompt),
+        tools=[*(get_tools(cfg["tools"]) if cfg["tools"] else []), *research_agent_tools(model, project_dir, mode, on_subagent), *test_agent_tools(model, project_dir, mode, on_subagent),
+               *web_advisor_tools(model, project_dir, mode, on_web_advisor, cancelled), *experiment_agent_tools(project_dir, mode, on_experiment), *skills.tools()],
+        system_prompt=compose_system(cfg["prompt"], custom_prompt) + DATA_RULES + DELEGATION_RULES + EXPERIMENT_RULES + ((TEST_DELEGATION_RULES + WEB_ADVISOR_RULES) if mode in {"agent", "code"} else "") + skills.prompt() + (
+            "\n缺少执行任务所必需的选择时，使用 ask_user 提问并等待回答。"
+            "查看远程服务器目录或文本优先使用 ssh_read；它只支持列目录、读文本和查看文件信息。"
+            "明确的只读命令可直接执行；修改命令、覆盖文件和修改源码会请求审批。"
+            "用户拒绝某操作后不要以其他工具绕过该决定。" if mode != "chat" else ""),
         middleware=[
+            PatchToolCallsMiddleware(),
             HumanInTheLoopMiddleware(
-                interrupt_on={"run_powershell": True, "run_bash": True}
+                interrupt_on=interrupt_config(project_dir)
             ),
-            ModelRetryMiddleware(max_retries=3),
+            ModelRetryMiddleware(max_retries=0 if getattr(model, "qwen_guarded", False) else 3),
             ToolRetryMiddleware(max_retries=2),
+            DurableToolResults(project_dir),
+            *([control_middleware(turn_control)] if turn_control else []),
             TodoListMiddleware(),
             FilesystemMiddleware(
                 backend=_fs_backend,
@@ -1242,16 +1264,18 @@ def build_agent(model: ChatOpenAI, mode: str, custom_prompt: str = "", *, checkp
             # 显式给 trigger：新版默认 trigger=None 会让摘要永不触发。
             # backend 让被驱逐的历史原文落盘到 conversation_history/，可 read_file 取回。
             SummarizationMiddleware(
-                model=model,
+                model=model.model_copy(update={"reasoning_effort": "none"}) if getattr(model, "qwen_guarded", False) else model,
                 backend=_fs_backend,
-                trigger=("fraction", 0.8),
+                trigger=summary_trigger,
                 keep=("messages", 20),
             ),
+            # Innermost tool wrapper sees full results before filesystem offloading.
+            ConversationArchive(),
         ],
         checkpointer=_get_checkpointer() if checkpointer is None else checkpointer,
     )
     # 每个模式独立 thread_id，对话记忆互不污染
-    return agent, {"configurable": {"thread_id": f"mode-{mode}"}}
+    return agent, {"configurable": {"thread_id": f"mode-{mode}", **({"skill_context": selected_context} if selected_context else {})}}
 
 
 CHAT_MAX_TOOL_ROUNDS = 6  # 两阶段各自的工具调用轮数上限，防止失控
@@ -1273,24 +1297,24 @@ def _stream_round(model_bt, convo, on_delta=None):
     if on_delta is None:
         resp = model_bt.invoke(convo)
         kw = getattr(resp, "additional_kwargs", {}) or {}
-        return resp.content, (kw.get("reasoning_content") or ""), (resp.tool_calls or []), resp
+        return content_text(resp.content), (kw.get("reasoning_content") or ""), (resp.tool_calls or []), resp
     final = None
     reasoning = ""
     for chunk in model_bt.stream(convo):
         final = chunk if final is None else final + chunk  # AIMessageChunk 可累加
         kw = getattr(chunk, "additional_kwargs", {}) or {}
         reasoning += kw.get("reasoning_content") or ""
-        delta = chunk.content
-        if isinstance(delta, str) and delta:
+        delta = content_text(chunk.content)
+        if delta:
             on_delta(delta)
     if final is None:
         return "", "", [], None
-    return final.content, reasoning, (final.tool_calls or []), final
+    return content_text(final.content), reasoning, (final.tool_calls or []), final
 
 
 def _chat_loop(
     model: ChatOpenAI, system_content: str, messages: list, tools: list,
-    trace: list | None = None, on_delta=None,
+    trace: list | None = None, on_delta=None, on_archive=None, final_stage=False,
 ):
     """chat 模式的内部对话循环：模型可自主调用文献/数据检索工具。
 
@@ -1301,34 +1325,69 @@ def _chat_loop(
     返回 (回复文本, reasoning_content 或 "")；回复为各轮文本的拼接
     （通常只有最后一轮有文本，中间轮的简短说明也会保留）。
     """
-    if not tools:
-        content, reasoning, _, _ = _stream_round(
-            model, [SystemMessage(content=system_content), *messages], on_delta)
+    from turn_control import CURRENT
+    control = CURRENT.get()
+    if not tools and not control:
+        convo = [SystemMessage(content=system_content), *messages]
+        if on_archive:
+            on_archive(convo)
+        content, reasoning, _, msg = _stream_round(model, convo, on_delta)
+        if on_archive and msg is not None:
+            on_archive([*convo, msg])
         return content, reasoning.strip()
 
-    model_bt = model.bind_tools(tools)
+    model_bt = model.bind_tools(tools) if tools else model
     by_name = {t.name: t for t in tools}
     convo = [SystemMessage(content=system_content), *messages]
     reasoning = ""
     texts: list = []
     for _ in range(CHAT_MAX_TOOL_ROUNDS):
+        if control:
+            control.check()
+            additions = control.additions()
+            if additions:
+                convo.extend(additions)
+                texts.clear()
+                reasoning = ""
+        if on_archive:
+            on_archive(convo)
         content, round_reasoning, tool_calls, msg = _stream_round(model_bt, convo, on_delta)
         reasoning = reasoning or round_reasoning.strip()
         if isinstance(content, str) and content:
             texts.append(content)
         if not tool_calls:
+            if on_archive and msg is not None:
+                on_archive([*convo, msg])
+            if control:
+                if msg is not None:
+                    convo.append(msg)
+                if control.has_pending() or final_stage and not control.seal_if_empty():
+                    continue
             return "\n\n".join(texts), reasoning
         convo.append(msg)
         for tc in tool_calls:
+            if control:
+                control.check()
+                if control.has_pending():
+                    convo.append(ToolMessage(content="用户已补充新方向，本次旧工具请求已取消，未执行。", tool_call_id=tc["id"], status="error"))
+                    continue
             tool = by_name.get(tc["name"])
-            result = tool.invoke(tc["args"]) if tool else f"未知工具: {tc['name']}"
+            if tool and tc["name"] in SUBAGENT_TOOL_NAMES:
+                result = tool.invoke({"name": tc["name"], "args": tc["args"], "id": tc["id"], "type": "tool_call"})
+                result = result.content if isinstance(result, ToolMessage) else result
+            else:
+                result = tool.invoke(tc["args"]) if tool else f"未知工具: {tc['name']}"
             convo.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+            if on_archive:
+                on_archive(convo)
             if trace is not None:
                 trace.append({
                     "tool": tc["name"],
                     "args": {k: str(v)[:80] for k, v in (tc["args"] or {}).items()},
                     "result": str(result)[:150],
                 })
+    if control and final_stage and not control.seal_if_empty():
+        raise ValueError("本轮达到模型步骤上限，补充指令尚未进入模型；请在下一轮继续")
     return "\n\n".join(texts), reasoning  # 轮数上限兜底
 
 
@@ -1337,6 +1396,11 @@ def chat_reply(
     attachments: list[str] | None = None,
     on_draft=None, on_answer=None,
     profile_name: str | None = None,
+    on_archive=None,
+    retrieval_data="",
+    memory_tools=None,
+    skill_context="",
+    skill_catalog="",
 ):
     """学术问答模式：两阶段生成，两阶段均可自主调用文献/数据检索工具。
 
@@ -1354,7 +1418,10 @@ def chat_reply(
     thinking = {"draft": 两阶段草稿或 None, "trace": 工具调用轨迹,
                 "reasoning": 模型自带 reasoning_content 或 ""}
     """
-    tools = get_tools("query")  # 查询类 + 文献类（arXiv/ADS），无 shell
+    tools = [*get_tools("query"), *(memory_tools or [])]  # Queries + a session-bound, read-only original resolver; no shell.
+    from turn_control import CURRENT
+    control = CURRENT.get()
+    applied_start = len(control.applied) if control else 0
     attach = [a for a in (attachments or []) if a]
     text_attach, visual_attach = _split_attachments(attach)
     # 本轮真正发给模型的消息（含附件全文/图片），与写进历史的轻量版分开
@@ -1362,25 +1429,32 @@ def chat_reply(
                                                         profile_name=profile_name))
     trace: list = []
     thinking = {"draft": None, "trace": trace, "reasoning": ""}
-    if os.environ.get("CHAT_TWO_STAGE", "1").lower() in ("0", "false", "no", "off"):
+    retrieved = [retrieval_message(retrieval_data)] if retrieval_data else []
+    if skill_context:
+        retrieved.append(skill_message(skill_context))
+    two_stage = os.environ.get("CHAT_TWO_STAGE", "0" if getattr(model, "qwen_guarded", False) else "1")
+    if two_stage.lower() in ("0", "false", "no", "off"):
         # 单阶段直答：一次调用，模型仍可自主查文献/数据
         reply, thinking["reasoning"] = _chat_loop(
             model,
-            compose_system(CHAT_PROMPT, custom_prompt),
-            [*chat_history, human_now],  # 历史 + 含附件的本次提问
+            compose_system(CHAT_PROMPT, custom_prompt) + DATA_RULES + DELEGATION_RULES + skill_catalog,
+            [*chat_history, *retrieved, human_now],  # Retrieved evidence is ephemeral, not visible user history.
             tools,
             trace=trace,
             on_delta=on_answer,
+            on_archive=on_archive,
+            final_stage=True,
         )
     else:
         # 阶段一：内部草稿，自由推理试错，可查文献/天体数据（全部附件都在场）
         draft, _ = _chat_loop(
             model,
-            compose_system(CHAT_DRAFT_PROMPT, custom_prompt),
-            [human_now],
+            compose_system(CHAT_DRAFT_PROMPT, custom_prompt) + DATA_RULES + DELEGATION_RULES + skill_catalog,
+            [*retrieved, human_now],
             tools,
             trace=trace,
             on_delta=on_draft,
+            on_archive=on_archive,
         )
         thinking["draft"] = draft
         # 阶段二：基于草稿输出结构化、标注置信度的最终回答。
@@ -1395,21 +1469,26 @@ def chat_reply(
             )
         reply, thinking["reasoning"] = _chat_loop(
             model,
-            compose_system(CHAT_PROMPT, custom_prompt),
+            compose_system(CHAT_PROMPT, custom_prompt) + DATA_RULES + DELEGATION_RULES + skill_catalog,
             [
                 *chat_history,  # 此前的对话历史
+                *retrieved,
                 HumanMessage(content=_compose_question(
                     question, text_attach,
                     extra=stage2_extra,
                     profile_name=profile_name,
                 )),
+                *(control.applied_messages(applied_start) if control else []),
             ],
             tools,
             trace=trace,
             on_delta=on_answer,
+            on_archive=on_archive,
+            final_stage=True,
         )
     chat_history.extend([
         HumanMessage(content=_history_note(question, attach)),
+        *(control.applied_messages(applied_start) if control else []),
         AIMessage(content=reply),
     ])
     return reply, thinking
@@ -1422,25 +1501,48 @@ def session_chat_reply(ctx: dict, question: str, *, on_draft=None, on_answer=Non
     store = ctx.get("store")
     sid = ctx.get("session_id")
     updated_history = history.copy()
+    run_id = uuid.uuid4().hex
+    on_archive = (lambda messages: store.archive_messages(sid, messages, run_id=run_id,
+                                                         thread_id=f"chat-{sid}-{run_id}", kind="chat_trace")) if store else None
+    retrieval = prepare_retrieval(store, sid, "chat", question, knowledge=ctx.get("knowledge"),
+                                  prefix=ctx.get("context_prefix_count", 0), budget=ctx.get("retrieval_budget", 6000)) if store else {"text": ""}
+    if retrieval["text"] and ctx.get("on_retrieval"):
+        ctx["on_retrieval"](retrieval)
+    model = observe_qwen(session_model(ctx), lambda messages: on_archive(messages)) if on_archive else session_model(ctx)
+    skills = SkillRuntime(ctx.get("project_dir") or Path(__file__).resolve().parent, scope=run_id, on_event=ctx.get("on_skill"))
+    skill_context = skills.selected(ctx.get("selected_skills"))
     reply, thinking = chat_reply(
-        session_model(ctx), updated_history, question,
+        model, updated_history, question,
         custom_prompt=ctx["custom_prompts"].get("chat", ""),
         attachments=ctx.get("attachments"),
         on_draft=on_draft,
         on_answer=on_answer,
         profile_name=ctx.get("current"),
+        on_archive=on_archive,
+        retrieval_data=retrieval["text"],
+        memory_tools=[*( [source_tool(store, sid), *research_chat_tools(model, Path(store._path).parent, store, sid, run_id, ctx.get("on_subagent"))] if store else []), *skills.tools()],
+        skill_context=skill_context, skill_catalog=skills.prompt(),
     )
     if store is not None:
         saved_count = ctx["saved_message_count"]
+        prefix = ctx.get("context_prefix_count", 0)
+        active_saved_count = saved_count - prefix + (1 if prefix else 0)
+        saved_history = ([*store.load_messages(sid)[:prefix], *updated_history[1:]]
+                         if prefix else updated_history)
         try:
-            store.replace_messages(sid, updated_history, first_question=question,
-                                   expected_count=saved_count)
+            store.replace_messages(sid, saved_history, first_question=question,
+                                   expected_count=saved_count, expected_token=ctx.get("memory_token"))
         except ChatHistoryChanged:
-            pending = history[saved_count:]
+            pending = history[active_saved_count:]
             load_chat_session(ctx, sid)
             history.extend(pending)
             raise
-        ctx["saved_message_count"] = len(updated_history)
+        saved, active, active_prefix, token = store.capture_context(sid)
+        ctx["saved_message_count"] = len(saved)
+        ctx["context_prefix_count"] = active_prefix
+        ctx["memory_token"] = token
+        history[:] = active
+        return reply, thinking
     history.extend(updated_history[history_size:])
     return reply, thinking
 
@@ -1509,20 +1611,72 @@ def session_model(ctx: dict):
         if "model_factory" in ctx:
             cache[key] = ctx["model_factory"](**params)
             return cache[key]
-        cache[key] = ChatOpenAI(
-            model=profile.get("model", "gpt-4o-mini"),
-            api_key=profile.get("api_key"),
-            base_url=profile.get("base_url") or None,
-            **params,
-        )
+        cache[key] = build_model(profile, **params)
     return cache[key]
 
 
 def load_chat_session(ctx: dict, sid: str) -> None:
-    messages = ctx["store"].load_messages(sid)
+    messages, context, prefix, token = ctx["store"].capture_context(sid)
     ctx["session_id"] = sid
-    ctx["chat_history"][:] = messages
+    ctx["chat_history"][:] = context
+    ctx["context_prefix_count"] = prefix
     ctx["saved_message_count"] = len(messages)
+    ctx["memory_token"] = token
+
+
+def compact_command(text: str, mode: str, ctx: dict) -> dict:
+    """Compact the current chat session or persistent agent thread without a tool loop."""
+    focus = compact_focus(text)
+    if focus is None:
+        raise ValueError("用法：/compact [保留重点]")
+    if mode == "chat":
+        # Unsaved model handoff notes remain in the active context after compaction.
+        prefix = ctx.get("context_prefix_count", 0)
+        active_saved = ctx["saved_message_count"] - prefix + (1 if prefix else 0)
+        pending = ctx["chat_history"][active_saved:]
+        result = compact_session(ctx["store"], ctx["session_id"], ctx["model"], focus)
+        if result["changed"]:
+            load_chat_session(ctx, ctx["session_id"])
+            ctx["chat_history"].extend(pending)
+        return result
+
+    from langchain_core.messages import RemoveMessage
+    from langgraph.graph.message import REMOVE_ALL_MESSAGES
+    from tools import _archive_block
+
+    agents = ctx["agents"]
+    custom = ctx["custom_prompts"].get(mode, "")
+    if mode not in agents or agents[mode]["model"] != ctx["current"] or agents[mode]["custom"] != custom:
+        agent, config = build_agent(ctx["model"], mode, custom)
+        agents[mode] = {"agent": agent, "config": config, "model": ctx["current"], "custom": custom}
+    record = agents[mode]
+    agent, config = record["agent"], record["config"]
+    snapshot = agent.get_state(config)
+    if snapshot.next:
+        raise RuntimeError("当前任务尚未结束，请完成任务或命令审批后再执行 /compact。")
+    messages = snapshot.values.get("messages", [])
+    cut, reason = plan_compaction(messages)
+    if not cut:
+        return {"changed": False, "text": reason}
+    summary_model = observe_qwen(ctx["model"], lambda raw: _archive_block(
+        config["configurable"]["thread_id"], "Qwen 原始压缩响应", raw))
+    summary = summarize(summary_model, messages[:cut], focus)
+    # Preserve any system messages; each protected human turn keeps all its tool results.
+    systems = [m for m in messages[:cut] if isinstance(m, SystemMessage)]
+    after = [*systems, summary_message(summary), *messages[cut:]]
+    result = compression_result(messages, after, summary, cut)
+    if not result["changed"]:
+        return result
+    if agent.get_state(config).config != snapshot.config:
+        raise ChatHistoryChanged("压缩期间任务已更新，请重新执行 /compact。")
+    block = _archive_block(config["configurable"]["thread_id"], summary, messages[:cut])
+    after[len(systems)] = summary_message(
+        f"原文归档：decompress('{block}')；search_context 可检索归档。\n{summary}")
+    result = compression_result(messages, after, summary, cut)
+    if not result["changed"]:
+        return result
+    agent.update_state(config, {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *after]})
+    return result
 
 
 def session_command(text: str, ctx: dict) -> str:
@@ -1566,7 +1720,7 @@ def session_command(text: str, ctx: dict) -> str:
                 return (f"已删除会话「{victim['title']}」，切换到最近会话"
                         f"「{rest[0]['title']}」（{len(rest)-1} 个会话剩余）")
             load_chat_session(ctx, store.create_session())
-            return f"已删除最后一个会话，已创建新会话"
+            return "已删除最后一个会话，已创建新会话"
         return f"已删除会话「{victim['title']}」"
 
     if sub.isdigit():
@@ -1609,7 +1763,33 @@ def handle_command(text: str, mode: str, custom_prompts: dict, ctx: dict | None 
     """
     parts = text.split()
     cmd = parts[0].lower()
-    if cmd == "/mode":
+    if cmd == "/resume":
+        if ctx is None or mode == "chat":
+            print("/resume 需要任务模式中的待处理中断")
+        else:
+            from agent_turn import run_agent_turn
+            from hitl import terminal_review
+            try:
+                agents = ctx["agents"]
+                custom = custom_prompts.get(mode, "")
+                if mode not in agents or agents[mode]["model"] != ctx["current"] or agents[mode]["custom"] != custom:
+                    agent, config = build_agent(ctx["model"], mode, custom)
+                    agents[mode] = {"agent": agent, "config": config, "model": ctx["current"], "custom": custom}
+                record = agents[mode]
+                answer, _ = run_agent_turn(record["agent"], record["config"], None,
+                                           on_answer=lambda delta: None, on_interrupts=terminal_review)
+                print(answer)
+            except Exception as exc:
+                print(f"[恢复失败] {exc}")
+    elif cmd == "/compact":
+        if ctx is None:
+            print("/compact 需要当前会话上下文")
+        else:
+            try:
+                print(compact_command(text, mode, ctx)["text"])
+            except Exception as exc:
+                print(f"[压缩失败] {exc}")
+    elif cmd == "/mode":
         if len(parts) == 1:
             print(f"当前模式: {mode}")
             for name, cfg in MODE_CONFIGS.items():
@@ -1765,7 +1945,7 @@ def handle_command(text: str, mode: str, custom_prompts: dict, ctx: dict | None 
     elif cmd == "/help":
         print(HELP_TEXT)
     else:
-        print("未知命令。可用: /mode [模式名]、/model [档案名]、/view [文件]、/tree、/browse、/prompt [内容]、/help")
+        print("未知命令。可用: /mode [模式名]、/model [档案名]、/compact [保留重点]、/view [文件]、/tree、/browse、/prompt [内容]、/help")
     return mode
 
 
@@ -1782,7 +1962,7 @@ def main():
     for i, arg in enumerate(sys.argv):
         if arg == "--mode" and i + 1 < len(sys.argv) and sys.argv[i + 1] in MODE_CONFIGS:
             mode = sys.argv[i + 1]
-    start_profile = "default"
+    start_profile = "default" if "default" in profiles else next(iter(profiles), "default")
     for i, arg in enumerate(sys.argv):
         if arg == "--model" and i + 1 < len(sys.argv) and sys.argv[i + 1] in profiles:
             start_profile = sys.argv[i + 1]
@@ -1790,7 +1970,7 @@ def main():
     try:
         model = build_model(profiles.get(start_profile))
     except ValueError as e:
-        raise SystemExit(f"{e}——请先复制 .env.example 为 .env，填入 API_KEY 后再运行。")
+        raise SystemExit(f"{e}——请先在工作台设置中添加模型，或配置 .env 后再运行。")
 
     custom_prompts: dict[str, str] = {}  # 模式名 -> 附加提示词（可有可无）
     for i, arg in enumerate(sys.argv):
@@ -1799,6 +1979,14 @@ def main():
 
     # chat 多会话：启动时恢复最近使用的会话（消息存 sessions.db，重启不丢）
     store = ChatStore(Path(__file__).resolve().parent / "sessions.db")
+    from knowledge_store import KnowledgeStore
+    knowledge_root = Path(__file__).resolve().parent
+    knowledge_stores = {"chat": store}
+    for knowledge_mode in ("agent", "research", "code"):
+        knowledge_path = knowledge_root / ".workbench" / f"{knowledge_mode}.db"
+        if knowledge_path.is_file():
+            knowledge_stores[knowledge_mode] = ChatStore(knowledge_path)
+    knowledge = KnowledgeStore(knowledge_root, knowledge_stores)
     sessions = store.list_sessions()
     if sessions:
         session_id = sessions[0]["id"]
@@ -1817,8 +2005,11 @@ def main():
         "chat_history": chat_history,
         "saved_message_count": len(chat_history),  # 不含尚未保存的模型交接说明
         "custom_prompts": custom_prompts,
+        "knowledge": knowledge,
         "attachments": [],  # chat 模式的待附加文件（/file 管理）
     }
+
+    load_chat_session(ctx, session_id)
 
     if "--repl" in sys.argv:
         _repl(mode, ctx)
@@ -1883,30 +2074,10 @@ def _repl(mode: str, ctx: dict) -> None:
                     }
                 agent = agents[mode]["agent"]
                 config = agents[mode]["config"]
-                result = agent.invoke(
-                    {"messages": [{"role": "user", "content": question}]},
-                    config=config,
-                )
-                # shell 工具触发人工审批：agent 暂停，循环处理直到无待审批项
-                while "__interrupt__" in result:
-                    req = result["__interrupt__"][0].value
-                    print("\n[请求执行命令，请审批]")
-                    print(req.get("description") or req)
-                    choice = input("y=批准 / n=拒绝 / 直接输入替代命令: ").strip()
-                    if choice.lower() == "y":
-                        decision = {"type": "approve"}
-                    elif choice.lower() == "n":
-                        decision = {
-                            "type": "reject",
-                            "message": "用户拒绝了这条命令，请改用其他方式完成，或询问用户怎么办。",
-                        }
-                    else:  # 用户输入了修改后的命令
-                        _reqs = (req or {}).get("action_requests") or []
-                        _tool = _reqs[0].get("name", "run_powershell") if _reqs else "run_powershell"
-                        decision = {"type": "edit",
-                                    "edited_action": {"name": _tool, "args": {"command": choice}}}
-                    result = agent.invoke(Command(resume={"decisions": [decision]}), config=config)
-                _ans = result['messages'][-1].content
+                from agent_turn import run_agent_turn
+                from hitl import terminal_review
+                _ans, _ = run_agent_turn(agent, config, [{"role": "user", "content": question}],
+                                         on_answer=lambda delta: None, on_interrupts=terminal_review)
                 print(f"\n天文Agent: {_ans}\n")
                 if _artifact_auto_fetch(ctx.get("current")):
                     try:

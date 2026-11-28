@@ -21,6 +21,41 @@ def _normalize_usage(chunk):
 
 
 class WorkbenchModel(ChatOpenAI):
+    def _stream(self, *args, **kwargs):
+        from turn_control import CURRENT, check_turn
+        control = CURRENT.get()
+        if control is None:
+            yield from super()._stream(*args, **kwargs)
+            return
+        import contextvars
+        import queue
+        import threading
+        from contextlib import suppress
+        check_turn()
+        source = super()._stream(*args, **kwargs)
+        events = queue.Queue()
+        context = contextvars.copy_context()
+        def produce():
+            try:
+                for chunk in source:
+                    control.check()
+                    events.put(("chunk", chunk))
+            except BaseException as exc:
+                events.put(("error", exc))
+            finally:
+                with suppress(Exception): source.close()
+                events.put(("done", None))
+        threading.Thread(target=lambda: context.run(produce), daemon=True, name="workbench-model-stream").start()
+        while True:
+            check_turn()
+            try: kind, value = events.get(timeout=0.1)
+            except queue.Empty: continue
+            if kind == "chunk": yield value
+            elif kind == "error":
+                check_turn()
+                raise value
+            else: return
+
     def _convert_chunk_to_generation_chunk(self, chunk, default_chunk_class, base_generation_info):
         return super()._convert_chunk_to_generation_chunk(
             _normalize_usage(chunk), default_chunk_class, base_generation_info,
