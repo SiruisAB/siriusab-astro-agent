@@ -62,7 +62,7 @@
 
 ## Anthropic 本地技能的取舍与融合（2026-11-24）
 
-用户提供的仓库位于 `C:\Users\lee\Desktop\ncu\github\skills`，实际来源为
+用户提供的本地技能仓库实际来源为
 `anthropics/skills`，不是 Addy 的工程技能仓库。仅只读使用下载内容，未修改该目录、
 联网拉取、安装 Codex 全局技能或执行上游脚本。
 

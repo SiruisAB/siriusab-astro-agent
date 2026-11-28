@@ -77,7 +77,7 @@ API URL、API Key、接口类型，以及可选的上下文窗口和流式用量
 ### 本地 Qwen coder390 接入
 
 模型 ID 为 `qwen3.8-27b-coder390` 时，自动启用专用适配；URL 可填
-`http://100.106.113.79:8088/v1`，接口选择 Chat Completions，本地免鉴权可勾选“无需 Key”。
+`http://<your-qwen-host>:8088/v1`，接口选择 Chat Completions，本地免鉴权可勾选“无需 Key”。
 其他模型的调用行为不变。本项目不会启动、停止或切换外部推理服务。
 
 - **模型请求并发固定为 1**：主 Agent、科研子 Agent、Chat、草稿和摘要共用服务地址的请求名额；
@@ -289,7 +289,7 @@ Code/Agent 中可请求“让测试子 Agent 根据指定源码编写回归测�
 
 | 档案 | MODEL_NAME | BASE_URL |
 |---|---|---|
-| `default`（当前） | `qwen3.8-27b-coder390` | `http://100.106.113.79:8088/v1` |
+| `default`（当前） | `qwen3.8-27b-coder390` | `http://<your-qwen-host>:8088/v1` |
 | `relay`（原中转站，保留） | `gpt-6-thinking` | `https://chat01.ai/v1` |
 
 `CONTEXT_WINDOW=262144` 已随主档案设置：既是工作台上下文占比的显示上限，
